@@ -1,4 +1,4 @@
-# **RASS-Based Medical Semantic Search & Query Answering System**
+# **RASS-Based Natural Language Querying on Medical/EHR Documents**
 
 A **Retrieval Augmented Semantic Search (RASS)** application designed for **intelligent search** on **EHR and medical document data**. The system integrates **Ollama's embedding models** for high-quality embeddings and leverages **OpenSearch** for efficient **text and vector searches**. It also utilizes **Redis** for intelligent query caching, ensuring accurate responses with near real-time latency. The users can use natural language for simple querying.
 
