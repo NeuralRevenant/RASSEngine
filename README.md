@@ -34,6 +34,8 @@ flowchart TD
     direction TB
         E["Embeddings"]
         F["Retrieval"]
+        G1["BlueHive AI LLM"]
+        G2["OpenAI LLM"]
         H["Redis Caching"]
   end
  subgraph Redis["Redis Instance"]
@@ -49,13 +51,24 @@ flowchart TD
         L["HNSW ANN Retrieval"]
         M["Medical Search Index"]
   end
+ subgraph BlueHive["BlueHive"]
+    direction TB
+        N["BlueHive AI Model"]
+  end
+ subgraph OpenAI["OpenAI"]
+    direction TB
+        O["OpenAI GPT-4o Model"]
+  end
     n1["Users"] --> C & D
-    D --> E & F & H
-    C --> E & F & H
+    D --> E & F & G2 & H
+    C --> E & F & G1 & H
     H --> I
     E --> J
     F --> L
     L --> M
+    G1 --> N
+    G2 --> O
+
 ```
 
 ---
