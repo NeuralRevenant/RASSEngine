@@ -8,6 +8,8 @@ openai  # OpenAI GPT-4o API calls
 python-dotenv
 asyncpg
 psycopg2
+prisma
+pydantic
 torch>=1.13.1
 transformers>=4.27.0 # intent classification
 sentence-transformers>=2.2.2

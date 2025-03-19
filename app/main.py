@@ -9,14 +9,26 @@ from contextlib import asynccontextmanager
 
 import httpx
 import uvicorn
-import redis
+import redis.asyncio as aioredis
 
-from fastapi import FastAPI, Body, WebSocket, WebSocketDisconnect
+from prisma import Prisma
+from pydantic import BaseModel
+
+db = Prisma()  # prisma client init
+
+import openai
+
+from fastapi import (
+    FastAPI,
+    Body,
+    WebSocket,
+    WebSocketDisconnect,
+    Depends,
+    HTTPException,
+)
+
 from opensearchpy import OpenSearch, RequestsHttpConnection
 from opensearchpy.helpers import bulk
-
-import spacy
-from langchain.memory import ConversationBufferMemory
 
 
 # Load .env file
@@ -28,26 +40,78 @@ load_dotenv()
 OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://localhost:11434/api")
 EMBED_MODEL_NAME = os.getenv("OLLAMA_EMBED_MODEL", "mxbai-embed-large:latest")
 
-MAX_BLUEHIVE_CONCURRENCY = 5
-MAX_EMBED_CONCURRENCY = 5
+MAX_BLUEHIVE_CONCURRENCY = int(os.getenv("MAX_BLUEHIVE_CONCURRENCY", 5))
+MAX_EMBED_CONCURRENCY = int(os.getenv("MAX_EMBED_CONCURRENCY", 5))
 
 BLUEHIVE_BEARER_TOKEN = os.getenv("BLUEHIVE_BEARER_TOKEN", "")
+BLUEHIVE_API_URL = os.getenv("BLUEHIVEAI_URL", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-BATCH_SIZE = 64
-CHUNK_SIZE = 512
-EMBED_DIM = 1024
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", 64))
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 512))
+EMBED_DIM = int(os.getenv("EMBED_DIM", 1024))
 
-REDIS_HOST = "localhost"
-REDIS_PORT = 6379
-REDIS_MAX_ITEMS = 1000
-REDIS_CACHE_LIST = "query_cache_lfu"
-CACHE_SIM_THRESHOLD = 0.96
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+REDIS_MAX_ITEMS = int(os.getenv("REDIS_MAX_ITEMS", 1000))
+REDIS_CACHE_LIST = os.getenv("REDIS_CACHE_LIST", "query_cache_lfu")
+CACHE_SIM_THRESHOLD = int(os.getenv("CACHE_SIM_THRESHOLD", 0.96))
+REDIS_SHORT_TTL_SECONDS = int(
+    os.getenv("REDIS_SHORT_TTL_SECONDS", 600)
+)  # short TTL for newly updated entries
 
-EMB_DIR = os.getenv("EMB_DIR", "notes")  # Directory for plain-text notes
+EMB_DIR = os.getenv("EMB_DIR", "notes")
 
 OPENSEARCH_HOST = os.environ.get("OPENSEARCH_HOST", "localhost")
 OPENSEARCH_PORT = int(os.environ.get("OPENSEARCH_PORT", 9200))
 OPENSEARCH_INDEX_NAME = os.getenv("OPENSEARCH_INDEX_NAME", "")
+
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
+POSTGRES_PORT = os.getenv("POSTGRES_PORT", "5432")
+POSTGRES_DB = os.getenv("POSTGRES_DB", "")
+POSTGRES_USER = os.getenv("POSTGRES_USER", "")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
+POSTGRES_DSN = f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
+
+MAX_CHAT_HISTORY = int(os.getenv("MAX_CHAT_HISTORY", 10))  # Limit to last 10 turns
+ADAPTIVE_CHUNKING = bool(
+    os.getenv("ADAPTIVE_CHUNKING", True)
+)  # If True - chunk size can adapt based on text length
+
+
+# -----------------------------------------------------------------------------
+# Pydantic Schemas
+# -----------------------------------------------------------------------------
+class ChatCreate(BaseModel):
+    userId: str
+    title: str
+
+
+class MessageCreate(BaseModel):
+    chatId: str
+    role: str
+    content: str
+
+
+class ChatHistoryResponse(BaseModel):
+    chatId: str
+    history: List[dict]
+
+
+# ==============================================================================
+# Database Setup - PostgreSQL
+# ==============================================================================
+async def get_user_chats(user_id: str):
+    chats = await db.chat.find_many(
+        where={"userId": user_id},
+        include={"messages": True},  # Fetch related messages
+        order={"createdAt": "desc"},
+    )
+    return chats  # Returns an async result
+
+
+async def get_db_pool():
+    return await asyncpg.create_pool(POSTGRES_DSN, max_size=20, min_size=1)
 
 
 # ==============================================================================
@@ -188,14 +252,13 @@ BLUEHIVE_SEMAPHORE = asyncio.Semaphore(MAX_BLUEHIVE_CONCURRENCY)
 
 async def bluehive_generate_text(prompt: str, system_msg: str = "") -> str:
     """
-    Asynchronously call BlueHive's /api/v1/completion endpoint.
+    Asynchronously call BlueHive's API endpoint.
     Passing a systemMessage plus the user prompt, and parse out the assistant's content.
     """
     headers = {
         "Authorization": f"Bearer {BLUEHIVE_BEARER_TOKEN}",
         "Content-Type": "application/json",
     }
-    url = os.getenv("BLUEHIVEAI_URL", "")
 
     payload = {
         "prompt": prompt,
@@ -206,7 +269,7 @@ async def bluehive_generate_text(prompt: str, system_msg: str = "") -> str:
         async with BLUEHIVE_SEMAPHORE:
             async with httpx.AsyncClient() as client:
                 resp = await client.post(
-                    url, json=payload, headers=headers, timeout=30.0
+                    BLUEHIVE_API_URL, json=payload, headers=headers, timeout=30.0
                 )
                 resp.raise_for_status()
                 data = resp.json()
@@ -551,6 +614,21 @@ class RAGModel:
 # ==============================================================================
 # FastAPI Application Setup
 # ==============================================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Handles database connection lifecycle
+    await db.connect()
+    print("[Lifespan] Initializing RAGModel...")
+    global rag_model
+    rag_model = RAGModel()
+
+    await rag_model.build_embeddings_from_scratch(EMB_DIR)
+    print("[Lifespan] RAGModel is ready.")
+    yield
+    print("[Lifespan] Server is shutting down...")
+    await db.disconnect()
+
+
 app = FastAPI(
     title="RAG with BlueHive/OpenAI + Jina Embeddings + OpenSearch + Redis",
     version="1.0.0",
@@ -562,20 +640,8 @@ app = FastAPI(
         "- Redis for caching\n"
         "- HTTP + WebSockets for streaming tokens\n"
     ),
+    lifespan=lifespan,
 )
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    print("[Lifespan] Initializing RAGModel...")
-    global rag_model
-    rag_model = RAGModel()
-
-    await rag_model.build_embeddings_from_scratch(EMB_DIR)
-    print("[Lifespan] RAGModel is ready.")
-    yield
-    print("[Lifespan] Server is shutting down...")
-
 
 app.router.lifespan_context = lifespan
 
@@ -606,11 +672,6 @@ async def ask_route(payload: dict = Body(...)):
 
     answer = await rm.ask(query, chat_id, top_k)
     return {"query": query, "answer": answer}
-
-
-import openai
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 
 async def openai_generate_text_stream(
