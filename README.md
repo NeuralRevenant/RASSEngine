@@ -1,6 +1,6 @@
-# **RAG-Based Medical Semantic Search & Query Answering System**
+# **RASS-Based Medical Semantic Search & Query Answering System**
 
-A Retrieval-Augmented Generation (RAG) application designed for **semantic search and intelligent query answering** on medical and EHR documents. This system seamlessly integrates **Ollama's embedding models** for high-quality embeddings, **BlueHiveAI** and **OpenAI** LLMs for context-aware text generation. It leverages **OpenSearch** for efficient **Approximate Nearest Neighbor** (ANN) vector searches and utilizes **Redis** for intelligent query caching, ensuring accurate responses with consistent near real-time latencies (<3.5s).
+A **Retrieval Augmented Semantic Search (RASS)** application designed for **intelligent search** on **EHR and medical document data**. The system integrates **Ollama's embedding models** for high-quality embeddings and leverages **OpenSearch** for efficient **text and vector searches**. It also utilizes **Redis** for intelligent query caching, ensuring accurate responses with near real-time latency. The users can use natural language for simple querying.
 
 ---
 
@@ -25,17 +25,15 @@ config:
     boxShadow: 5px 5px 15px rgba(0, 0, 0, 0.6)
 ---
 flowchart TD
- subgraph FastAPI["Semantic Query Engine - FastAPI Endpoints"]
+ subgraph FastAPI["RASS Engine - FastAPI Endpoints"]
     direction TB
         C["POST /ask"]
         D["WS /ws/ask"]
   end
- subgraph RAG_Model["RAG Architecture"]
+ subgraph RASS_Model["RASS Architecture"]
     direction TB
         E["Embeddings"]
         F["Retrieval"]
-        G1["BlueHive AI LLM"]
-        G2["OpenAI LLM"]
         H["Redis Caching"]
   end
  subgraph Redis["Redis Instance"]
@@ -51,61 +49,53 @@ flowchart TD
         L["HNSW ANN Retrieval"]
         M["Medical Search Index"]
   end
- subgraph BlueHive["BlueHive"]
-    direction TB
-        N["BlueHive AI Model"]
-  end
- subgraph OpenAI["OpenAI"]
-    direction TB
-        O["OpenAI GPT-4o Model"]
-  end
     n1["Users"] --> C & D
-    D --> E & F & G2 & H
-    C --> E & F & G1 & H
+    D --> E & F & H
+    C --> E & F & H
     H --> I
     E --> J
     F --> L
     L --> M
-    G1 --> N
-    G2 --> O
 ```
 
 ---
 
 ## **Key Features**
-- **Semantic Search**: Utilizes **mxbai-embed-large:latest** (1024-dimensional vectors) through Ollama to generate high-dimensional semantic representations of text.
-- **Retrieval-Augmented Generation (RAG)**: Combines **OpenSearch** for vector-based ANN retrieval with **BlueHiveAI** for advanced query answering.
-- **Efficient Caching**:
-  - **Redis** stores query embeddings and responses to reduce latency and optimize performance.
-  - Uses **cosine similarity** for cache lookups to avoid redundant computation.
-- **Fast and Scalable Search**:
-  - **OpenSearch HNSW ANN** enables efficient nearest-neighbor searches.
-  - Capable of indexing and retrieving large-scale medical document datasets.
-- **REST API Integration**: Exposes endpoints for semantic search and query answering over indexed medical texts using **FastAPI**.
+- **Search**: Uses **mxbai-embed-large:latest** (1024-dimensional vectors) via Ollama to generate high-quality **semantic embeddings**.
+- **Retrieval-Augmented Semantic Search (RASS)**:
+  - Combines **OpenSearch** for **text-based + ANN-based (hybrid) retrieval** with **semantic ranking** to improve query accuracy.
+- **Efficient Query Caching**:
+  - **Redis** caches query embeddings and responses, reducing redundant computation.
+  - Uses **cosine similarity** for intelligent cache lookups.
+- **Scalable Medical Document Search**:
+  - **OpenSearch HNSW ANN** enables **efficient vector retrieval** at scale.
+  - Supports large-scale **EHR and medical document datasets**.
+- **REST API for Semantic Querying**:
+  - **FastAPI-based endpoints** provide an interface for **real-time search and query answering**.
 - **Robust Text Processing**:
-  - Cleans and chunks text before embedding.
-  - Retrieves relevant document chunks for context-aware answers.
+  - **Preprocessing and chunking** of documents before embedding for optimal retrieval.
+  - **Relevance ranking** ensures the most contextually appropriate results.
 - **Error Handling & Resilience**:
-  - Comprehensive exception handling for HTTP requests.
-  - Graceful fallbacks and informative error messages for better user experience.
+  - **Comprehensive exception handling** for robust API performance.
+  - **Fallback mechanisms** improve reliability for query execution.
 
 ---
 
 ## **How It Works**
 1. **Embedding Generation**:
-   - Input text is converted into embeddings using **mxbai-embed-large:latest** via Ollama.
+   - Text is converted into high-dimensional embeddings using **mxbai-embed-large:latest** via Ollama.
 2. **Query Caching**:
-   - Query embeddings are compared with cached results in **Redis**.
-   - If a similar query is found, the cached response is returned, reducing latency.
-3. **ANN-Based Retrieval**:
-   - If no cache hit, **OpenSearch** performs **HNSW ANN** retrieval to find the most relevant document chunks.
-4. **Contextual Response Generation**:
-   - Retrieved context is sent to **BlueHiveAI** or **OpenAI** for final answer generation.
-   - The response is stored in Redis for future queries, optimizing performance.
+   - Query embeddings are matched with stored results in **Redis**.
+   - Cached responses are returned when a match is found, improving performance.
+3. **Semantic Retrieval via ANN**:
+   - If no cache hit, **OpenSearch** performs **HNSW ANN retrieval** for relevant document chunks.
+4. **Contextual Query Answering**:
+   - Retrieved **document chunks** are used to generate **accurate medical responses**.
+   - Responses are **cached in Redis** for future queries.
 
 ---
 
-## Retrieval-Augmented Query Answering**
+## **Retrieval-Augmented Query Answering**
 - **Endpoint**: `/ask`
 - **Method**: `POST`
 - **Request**:
@@ -121,17 +111,15 @@ flowchart TD
         "answer": "Ghrelin is a peptide hormone secreted by endocrine cells in the gastrointestinal tract, known for its role in stimulating food intake and regulating energy balance. It acts in the central nervous system to modulate gastrointestinal functions, such as gastric acid secretion and motility, and is involved in the autonomic regulation of these functions. Ghrelin's effects on food intake are mediated by neuropeptide Y pathways in the central nervous system (Document ABC, Document XYZ)."
     }
     ```
-    
+
 ---
 
 ## **Architecture Overview**
-The system is architected as a **microservices-based RAG pipeline** with the following components:
-- **FastAPI**: Exposes RESTful endpoints for query input and response output.
-- **Ollama Embedding Service**: Generates high-dimensional embeddings using **mxbai-embed-large:latest**.
-- **OpenSearch**: Stores indexed document embeddings and performs **HNSW ANN** retrieval.
-- **Redis**: Caches query embeddings and responses for efficient lookups.
-- **BlueHiveAI**: Handles text generation using retrieved context, ensuring intelligent and context-aware answers.
-- **OpenAI**: Handles text generation with the retrieved context using the **'streaming'** mode, ensuring intelligent and context-aware answers with additional usability in WebSocket based APIs and not just HTTP.
+The system follows a **microservices-based RASS pipeline** with the following core components:
+- **FastAPI**: Provides RESTful API for **semantic search** and query answering.
+- **Ollama Embedding Service**: Generates **high-dimensional text embeddings**.
+- **OpenSearch**: Performs **ANN-based retrieval** for document chunks.
+- **Redis**: Caches query embeddings and responses for **low-latency retrieval**.
 
 ---
 
@@ -139,10 +127,10 @@ The system is architected as a **microservices-based RAG pipeline** with the fol
 
 ### **Prerequisites**
 1. **Python 3.8+**
-2. **Environment Setup**:
-   - **Ollama**: Running locally on `http://localhost:11434/api` or in a cloud environment
-   - **OpenSearch**: Hosted locally or in a cloud environment
-   - **Redis**: Running locally or in a cloud environment on port `6379`
+2. **Required Services**:
+   - **Ollama** (running locally or in the cloud)
+   - **OpenSearch** (local/cloud-based indexing)
+   - **Redis** (for query caching)
 
 ### **Install Dependencies**
 ```bash
@@ -158,38 +146,36 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 ## **Code Highlights**
 
-### **1. Redis-based Query Caching**
-- Caches query embeddings and responses to optimize performance.
-- Utilizes **cosine similarity** to identify previously asked queries and avoid redundant API calls.
+### **1. Query Caching with Redis**
+- **Caches embeddings and responses**, reducing redundant processing.
+- Uses **cosine similarity** for **fast retrieval** of previously seen queries.
 
-### **2. OpenSearch ANN Indexing**
-- Documents are indexed using **HNSW (Hierarchical Navigable Small World)** for fast vector retrieval.
-- Search results are ranked based on similarity scores.
+### **2. OpenSearch Text-based + ANN-Based (Hybrid) Search and Indexing**
+- **HNSW-based vector indexing** for **efficient nearest-neighbor search**.
+- **Semantic ranking** ensures **relevant document retrieval**.
 
-### **3. Dynamic Query Handling**
-- Queries first check **Redis cache** for stored responses.
-- If no cached response is found, **OpenSearch** retrieves relevant documents.
-- **BlueHiveAI** or **OpenAI** generates final responses based on retrieved context.
-- The new query-response pair is cached in Redis for future lookups.
+### **3. Dynamic Query Processing**
+- Queries first check **Redis cache**.
+- If no cached result, **OpenSearch retrieves relevant chunks**.
+- The **retrieved text** is used for **context-aware response generation**.
+- The final response is **cached for future lookups**.
 
 ---
 
 ## **Scalability & Performance**
-- **OpenSearch** supports indexing **millions of documents** for scalable retrieval.
-- **Redis caching** significantly reduces response latency.
-- **Ollama's embedding model** ensures accurate semantic understanding.
-- **BlueHiveAI** or **OpenAI** provides context-aware text generation with consistent latencies <3.5s.
+- **OpenSearch indexes millions of medical documents** for efficient retrieval.
+- **Redis caching reduces latency**, ensuring **real-time responses**.
+- **Ollama embeddings improve search accuracy**, leveraging **high-quality vector representations**.
 
 ---
 
-## **Future Improvements**
-- Add **multi-hop document retrieval** for handling even more complex queries.
-- Optimize **query expansion techniques** for better recall.
-- Add support for **multi-modal retrieval** (text + images).
-- Implement **continuous learning** to refine embeddings over time.
-- Integrate **advanced ranking models** for improved search relevance.
-- Add a Full-stack interface for the RAG-based medical chatbot application encompassing the semantic query engine.
+## **Future Enhancements**
+- Implement **multi-hop retrieval** for **more complex medical queries**.
+- Optimize **query expansion techniques** for **better search recall**.
+- Extend **multi-modal search support** (text + structured data).
+- Enhance **real-time ranking mechanisms** for **improved search relevance**.
+- Develop a **full-stack user interface** for the **RASS-based medical chatbot**.
 
 ---
 
-Feel free to reach out for any improvements, suggestions, or discussions. Your contributions are always welcome! 🚀
+**Contributions & Feedback Welcome!** 🚀
