@@ -12,9 +12,6 @@ import uvicorn
 import redis.asyncio as aioredis
 
 from prisma import Prisma
-from pydantic import BaseModel
-
-db = Prisma()  # prisma client init
 
 import openai
 
@@ -79,45 +76,19 @@ ADAPTIVE_CHUNKING = bool(
 )  # If True - chunk size can adapt based on text length
 
 
-# -----------------------------------------------------------------------------
-# Pydantic Schemas
-# -----------------------------------------------------------------------------
-class ChatCreate(BaseModel):
-    userId: str
-    title: str
-
-
-class MessageCreate(BaseModel):
-    chatId: str
-    role: str
-    content: str
-
-
-class ChatHistoryResponse(BaseModel):
-    chatId: str
-    history: List[dict]
-
-
-# ==============================================================================
-# Database Setup - PostgreSQL
-# ==============================================================================
-async def get_user_chats(user_id: str):
-    chats = await db.chat.find_many(
-        where={"userId": user_id},
-        include={"messages": True},  # Fetch related messages
-        order={"createdAt": "desc"},
-    )
-    return chats  # Returns an async result
-
-
-async def get_db_pool():
-    return await asyncpg.create_pool(POSTGRES_DSN, max_size=20, min_size=1)
+db = Prisma()  # prisma client init
 
 
 # ==============================================================================
 # Redis Client & Cache Functions
 # ==============================================================================
-redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0)
+redis_client = aioredis.from_url(
+    f"redis://{REDIS_HOST}:{REDIS_PORT}", decode_responses=True
+)
+
+
+async def close_redis():
+    await redis_client.close()
 
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -125,12 +96,13 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     norm_b = np.linalg.norm(b)
     if norm_a == 0.0 or norm_b == 0.0:
         return 0.0
+
     return float(np.dot(a, b) / (norm_a * norm_b))
 
 
-def lfu_cache_get(query_emb: np.ndarray) -> Optional[str]:
+async def lfu_cache_get(query_emb: np.ndarray) -> Optional[str]:
     """Retrieve a cached answer if we find a sufficiently similar embedding."""
-    cached_list = redis_client.lrange(REDIS_CACHE_LIST, 0, -1)
+    cached_list = await redis_client.lrange(REDIS_CACHE_LIST, 0, -1)
     if not cached_list:
         return None
 
@@ -142,7 +114,6 @@ def lfu_cache_get(query_emb: np.ndarray) -> Optional[str]:
     for i, item in enumerate(cached_list):
         entry = json.loads(item)
         emb_list = entry["embedding"]
-
         cached_emb = np.array(emb_list, dtype=np.float32)
         sim = cosine_similarity(query_vec, cached_emb)
         if sim > best_sim:
@@ -156,15 +127,17 @@ def lfu_cache_get(query_emb: np.ndarray) -> Optional[str]:
     if best_entry_data:
         # increment freq
         best_entry_data["freq"] = best_entry_data.get("freq", 1) + 1
-        redis_client.lset(REDIS_CACHE_LIST, best_index, json.dumps(best_entry_data))
+        await redis_client.lset(
+            REDIS_CACHE_LIST, best_index, json.dumps(best_entry_data)
+        )
         return best_entry_data["response"]
 
     return None
 
 
-def _remove_least_frequent_item():
+async def _remove_least_frequent_item():
     """Helper to remove the least frequently used entry from Redis."""
-    cached_list = redis_client.lrange(REDIS_CACHE_LIST, 0, -1)
+    cached_list = await redis_client.lrange(REDIS_CACHE_LIST, 0, -1)
     if not cached_list:
         return
 
@@ -179,28 +152,29 @@ def _remove_least_frequent_item():
 
     if min_index >= 0:
         item_str = cached_list[min_index]
-        redis_client.lrem(REDIS_CACHE_LIST, 1, item_str)
+        await redis_client.lrem(REDIS_CACHE_LIST, 1, item_str)
 
 
-def lfu_cache_put(query_emb: np.ndarray, response: str):
+async def lfu_cache_put(query_emb: np.ndarray, response: str):
     """Insert a new entry into the LFU Redis cache."""
     entry = {"embedding": query_emb.tolist()[0], "response": response, "freq": 1}
-    current_len = redis_client.llen(REDIS_CACHE_LIST)
+    current_len = await redis_client.llen(REDIS_CACHE_LIST)
     if current_len >= REDIS_MAX_ITEMS:
-        _remove_least_frequent_item()
+        await _remove_least_frequent_item()
 
-    redis_client.lpush(REDIS_CACHE_LIST, json.dumps(entry))
+    await redis_client.lpush(REDIS_CACHE_LIST, json.dumps(entry))
 
 
 # ==============================================================================
-# Asynchronous Functions for Ollama Embeddings
+# Ollama Embeddings
 # ==============================================================================
-async def ollama_embed_text(text: str, model: str = EMBED_MODEL_NAME) -> List[float]:
-    """
-    Request an embedding for `text` from Ollama via HTTP POST (using the Jina model).
-    """
+async def ollama_embed_text(text: str) -> List[float]:
+    """Get an embedding from Ollama for a single text."""
+    if not text.strip():
+        return [0.0] * EMBED_DIM
+
     async with httpx.AsyncClient() as client:
-        payload = {"model": model, "prompt": text, "stream": False}
+        payload = {"model": EMBED_MODEL_NAME, "prompt": text, "stream": False}
         resp = await client.post(
             f"{OLLAMA_API_URL}/embeddings", json=payload, timeout=30.0
         )
@@ -240,21 +214,24 @@ async def embed_query(query: str) -> np.ndarray:
     if not query.strip():
         return np.array([])
 
-    emb = await ollama_embed_text(query, EMBED_MODEL_NAME)
-    return np.array([emb], dtype=np.float32)
+    emb_list = await ollama_embed_text(query)
+    return np.array([emb_list], dtype=np.float32)
 
 
 # ==============================================================================
-# BlueHive Completion Generation
+# Ozwell/BlueHive LLM
 # ==============================================================================
 BLUEHIVE_SEMAPHORE = asyncio.Semaphore(MAX_BLUEHIVE_CONCURRENCY)
 
 
 async def bluehive_generate_text(prompt: str, system_msg: str = "") -> str:
     """
-    Asynchronously call BlueHive's API endpoint.
-    Passing a systemMessage plus the user prompt, and parse out the assistant's content.
+    Asynchronous call to BlueHive's API endpoint. Passing a systemMessage plus
+    the user prompt, and parse out the assistant's content.
     """
+    if not BLUEHIVE_API_URL:
+        return "[ERROR] LLM not configured."
+
     headers = {
         "Authorization": f"Bearer {BLUEHIVE_BEARER_TOKEN}",
         "Content-Type": "application/json",
@@ -266,23 +243,16 @@ async def bluehive_generate_text(prompt: str, system_msg: str = "") -> str:
     }
 
     try:
-        async with BLUEHIVE_SEMAPHORE:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    BLUEHIVE_API_URL, json=payload, headers=headers, timeout=30.0
-                )
-                resp.raise_for_status()
-                data = resp.json()
+        async with BLUEHIVE_SEMAPHORE, httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(BLUEHIVE_API_URL, json=payload, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
 
-        # expecting data["choices"][0]["message"]["content"]
-        choices = data.get("choices", [])
-        if not choices:
+        if "choices" not in data or not data["choices"]:
             return "[ERROR] No choices in BlueHive response."
+        # expecting data["choices"][0]["message"]["content"]
 
-        first_choice = choices[0]
-        message = first_choice.get("message", {})
-        content = message.get("content", "")
-        return content.strip()
+        return data["choices"][0].get("message", {}).get("content", "").strip()
     except httpx.HTTPStatusError as e:
         # handling the HTTP errors gracefully
         print(f"[ERROR] HTTPStatusError: {str(e)}")
@@ -306,9 +276,8 @@ async def bluehive_generate_text(prompt: str, system_msg: str = "") -> str:
 
 
 # ==============================================================================
-# OpenSearch Setup with HNSW ANN
+# OpenSearch Retrieval
 # ==============================================================================
-
 
 os_client: Optional[OpenSearch] = None
 try:
@@ -342,10 +311,10 @@ try:
                 }
             },
         }
-        resp = os_client.indices.create(index=OPENSEARCH_INDEX_NAME, body=index_body)
-        print(f"[INFO] Created '{OPENSEARCH_INDEX_NAME}' index with HNSW.")
+        os_client.indices.create(index=OPENSEARCH_INDEX_NAME, body=index_body)
+        print(f"[INFO] Created '{OPENSEARCH_INDEX_NAME}' index.")
     else:
-        print(f"[INFO] OpenSearch index '{OPENSEARCH_INDEX_NAME}' is ready.")
+        print(f"[INFO] Using existing index '{OPENSEARCH_INDEX_NAME}'.")
 except Exception as e:
     print(f"[WARNING] OpenSearch not initialized: {e}")
     os_client = None
@@ -527,7 +496,13 @@ class RAGModel:
 
         return self.os_indexer.search(query_emb, k=top_k)
 
-    async def ask(self, query: str, chat_id: str = None, top_k: int = 3) -> str:
+    async def ask(
+        self,
+        query: str,
+        user_id: str = None,
+        chat_id: str = None,
+        top_k: int = 3,
+    ) -> str:
         """
         Pipeline for a user query:
           1) Check if query is empty.
@@ -543,18 +518,40 @@ class RAGModel:
         if not chat_id:
             return "[ERROR] Incorrect account/chat details!"
 
-        # load or init memory for this chat session
-        if chat_id not in self.memory_store:
-            self.memory_store[chat_id] = ConversationBufferMemory(
-                memory_key="chat_history", return_messages=True
+        # verify user owns chat
+        chat = await db.chat.find_unique(where={"id": chat_id}, include={"user": True})
+
+        if not chat or chat.userId != user_id:
+            raise HTTPException(
+                status_code=403, detail="Chat not found or unauthorized access"
             )
 
-        memory = self.memory_store[chat_id]
+        # fetch last 'MAX_CHAT_HISTORY' messages for context
+        messages = await db.message.find_many(
+            where={"chatId": chat_id},
+            order={"createdAt": "desc"},
+            take=MAX_CHAT_HISTORY,
+        )
 
-        # Check cache
+        # build chat history
+        # newest message is first => reverse to chronological
+        messages.reverse()
+        chat_history_str = ""
+        for m in messages:
+            role_label = "User" if m.role == "user" else "AI"
+            chat_history_str += f"{role_label}: {m.content}\n"
+
+        # embed query & check cache
         query_emb = await embed_query(query)
-        cached_resp = lfu_cache_get(query_emb)
+        cached_resp = await lfu_cache_get(query_emb)
         if cached_resp:
+            # store new user message + cached answer
+            await db.message.create(
+                data={"chatId": chat_id, "role": "user", "content": query}
+            )
+            await db.message.create(
+                data={"chatId": chat_id, "role": "assistant", "content": cached_resp}
+            )
             print("[RAGModel] Found a similar query in Redis. Returning cached result.")
             return cached_resp
 
@@ -575,22 +572,19 @@ class RAGModel:
             print(doc_id)
             context_text += f"--- Document ID: {doc_id} ---\n{doc_content}\n\n"
 
-        # get the chat history from memory
-        chat_history = memory.buffer_as_str
-
         # build the prompt with chat history and current query
         system_msg = (
             "You are a helpful AI assistant chatbot. You must follow these rules:\n"
             "1) Always cite document IDs from the context exactly as 'Document XYZ' without any file extensions like '.txt'.\n"
             "2) For every answer generated, there should be a reference or citation of the IDs of the documents from which the answer information was extracted at the end of the answer!\n"
             "3) If the context does not relate to the query, say 'I lack the context to answer your question.' For example, if the query is about gene mutations but the context is about climate change, acknowledge the mismatch and do not answer.\n"
-            "4) Never ever give responses based on your own knowledge of the user query. Only use the provided context to extract information relevant to the question. You should not answer without document ID references from which the information was extracted.\n"
+            "4) Never ever give responses based on your own knowledge of the user query. Use ONLY the provided context + chat history to extract information relevant to the question. You should not answer without document ID references from which the information was extracted.\n"
             "5) If you lack context, then say so.\n"
             "6) Do not add chain-of-thought.\n"
             # "7) Answer in at most 4 sentences.\n"
         )
         final_prompt = (
-            f"Chat History: {chat_history}\n\n"
+            f"Chat History:\n{chat_history_str}\n\n"
             f"User Query:\n{query}\n\n"
             f"Context:\n{context_text}\n"
             "--- End of context ---\n\n"
@@ -601,13 +595,17 @@ class RAGModel:
             prompt=final_prompt, system_msg=system_msg
         )
         if not answer:
-            return "Error: No response was generated. Please try later!"
+            return "[Error] No response was generated."
 
-        # save the query and answer to memory
-        memory.save_context({"input": query}, {"output": answer})
-
+        # store new user message + AI response
+        await db.message.create(
+            data={"chatId": chat_id, "role": "user", "content": query}
+        )
+        await db.message.create(
+            data={"chatId": chat_id, "role": "assistant", "content": answer}
+        )
         # cache the resp
-        lfu_cache_put(query_emb, answer)
+        await lfu_cache_put(query_emb, answer)
         return answer
 
 
@@ -627,19 +625,12 @@ async def lifespan(app: FastAPI):
     yield
     print("[Lifespan] Server is shutting down...")
     await db.disconnect()
+    await close_redis()
 
 
 app = FastAPI(
-    title="RAG with BlueHive/OpenAI + Jina Embeddings + OpenSearch + Redis",
+    title="RASS Engine - /ask Query Microservice",
     version="1.0.0",
-    description=(
-        "RAG pipeline using:\n"
-        "- BlueHive AI/OpenAI for text generation\n"
-        "- Ollama's Jina embeddings for document/query embeddings\n"
-        "- OpenSearch for ANN retrieval\n"
-        "- Redis for caching\n"
-        "- HTTP + WebSockets for streaming tokens\n"
-    ),
     lifespan=lifespan,
 )
 
@@ -653,24 +644,30 @@ def get_rag_model() -> RAGModel:
 @app.post("/ask")
 async def ask_route(payload: dict = Body(...)):
     """
-    API endpoint that processes a user query through the RAG pipeline:
-    1) Retrieval from OpenSearch
-    2) BlueHive generation
-    3) Redis caching
+    RASS endpoint:
+      1) user_id, chat_id, query => verify user owns chat
+      2) fetch last 10 messages for context
+      3) embed query => check redis => if new
+      4) retrieve from OpenSearch => build context
+      5) call BlueHive => store new user query + new response in DB
     """
+    query: str = payload.get("query", "")
     user_id = payload.get("user_id", "")
     chat_id = payload.get("chat_id", "")
-    query: str = payload.get("query", "")
-    if not query.strip():
-        return {"query": "", "answer": "[ERROR] Empty query."}
+    if not user_id or not chat_id or not query.strip():
+        raise HTTPException(
+            status_code=400, detail="Must provide user_id, chat_id, query"
+        )
 
-    top_k = payload.get("top_k", 3)
+    top_k = int(payload.get("top_k", 3))
+
     print(f"[Debug] query = {query}, top_k = {top_k}")
+
     rm = get_rag_model()
     if not rm:
         return {"error": "RAGModel not initialized"}
 
-    answer = await rm.ask(query, chat_id, top_k)
+    answer = await rm.ask(query, user_id, chat_id, top_k)
     return {"query": query, "answer": answer}
 
 
