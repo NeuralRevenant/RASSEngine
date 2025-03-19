@@ -100,6 +100,9 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / (norm_a * norm_b))
 
 
+import time
+
+
 async def lfu_cache_get(query_emb: np.ndarray) -> Optional[str]:
     """Retrieve a cached answer if we find a sufficiently similar embedding."""
     cached_list = await redis_client.lrange(REDIS_CACHE_LIST, 0, -1)
@@ -125,8 +128,15 @@ async def lfu_cache_get(query_emb: np.ndarray) -> Optional[str]:
         return None
 
     if best_entry_data:
+        current_time = int(time.time())
+        if "expiry" in best_entry_data and best_entry_data["expiry"] < current_time:
+            # remove expired entry
+            await redis_client.lrem(REDIS_CACHE_LIST, 1, json.dumps(best_entry_data))
+            return None
+
         # increment freq
         best_entry_data["freq"] = best_entry_data.get("freq", 1) + 1
+        best_entry_data["last_used"] = current_time  # track last usage
         await redis_client.lset(
             REDIS_CACHE_LIST, best_index, json.dumps(best_entry_data)
         )
@@ -143,21 +153,33 @@ async def _remove_least_frequent_item():
 
     min_freq = float("inf")
     min_index = -1
+    min_entry = None
     for i, item in enumerate(cached_list):
         entry = json.loads(item)
         freq = entry.get("freq", 1)
         if freq < min_freq:
             min_freq = freq
             min_index = i
+            min_entry = entry
 
-    if min_index >= 0:
-        item_str = cached_list[min_index]
-        await redis_client.lrem(REDIS_CACHE_LIST, 1, item_str)
+    # if found - remove it
+    if min_index >= 0 and min_entry:
+        await redis_client.lrem(REDIS_CACHE_LIST, 1, json.dumps(min_entry))
 
 
 async def lfu_cache_put(query_emb: np.ndarray, response: str):
-    """Insert a new entry into the LFU Redis cache."""
-    entry = {"embedding": query_emb.tolist()[0], "response": response, "freq": 1}
+    """Insert a new entry into the LFU Redis cache with a TTL to avoid stale data."""
+    current_time = int(time.time())
+    expiry_time = current_time + REDIS_SHORT_TTL_SECONDS  # exp time set
+
+    entry = {
+        "embedding": query_emb.tolist()[0],
+        "response": response,
+        "freq": 1,
+        "last_used": current_time,
+        "expiry": expiry_time,
+    }
+
     current_len = await redis_client.llen(REDIS_CACHE_LIST)
     if current_len >= REDIS_MAX_ITEMS:
         await _remove_least_frequent_item()
