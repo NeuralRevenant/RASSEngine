@@ -344,7 +344,7 @@ except Exception as e:
 
 class OpenSearchIndexer:
     """
-    Index documents with embeddings into OpenSearch using the HNSW algorithm.
+    Index documents with embeddings into OpenSearch with a hybrid search approach
     """
 
     def __init__(self, client: OpenSearch, index_name: str):
@@ -398,7 +398,28 @@ class OpenSearchIndexer:
         except Exception as e:
             print(f"[OpenSearchIndexer] Bulk indexing error: {e}")
 
-    def search(
+    def exact_match_search(
+        self, query_text: str, k: int = 3
+    ) -> List[Tuple[Dict[str, str], float]]:
+        if not self.client or not query_text.strip():
+            return []
+
+        query_body = {"size": k, "query": {"match": {"text": query_text}}}
+        try:
+            resp = self.client.search(index=OPENSEARCH_INDEX_NAME, body=query_body)
+            hits = resp["hits"]["hits"]
+            results = []
+            for h in hits:
+                doc_score = h["_score"]
+                doc_source = h["_source"]
+                results.append((doc_source, float(doc_score)))
+
+            return results
+        except Exception as e:
+            print(f"[OpenSearchIndexer - Exact Match] Search error: {e}")
+            return []
+
+    def semantic_search(
         self, query_emb: np.ndarray, k: int = 3
     ) -> List[Tuple[Dict[str, str], float]]:
         if not self.client or query_emb.size == 0:
@@ -420,10 +441,47 @@ class OpenSearchIndexer:
                 doc_source = h["_source"]
                 results.append((doc_source, float(doc_score)))
 
-            print(f"[OpenSearchIndexer] Found {len(results)} relevant results.")
+            print(
+                f"[OpenSearchIndexer - Semantic Search] Found {len(results)} relevant results."
+            )
             return results
         except Exception as e:
-            print(f"[OpenSearchIndexer] Search error: {e}")
+            print(f"[OpenSearchIndexer - Semantic Search] Search error: {e}")
+            return []
+
+    def hybrid_search(
+        self, query_text: str, query_emb: np.ndarray, k: int = 3
+    ) -> List[Tuple[Dict[str, str], float]]:
+        if not self.client or not query_text.strip() or not query_emb:
+            return []
+
+        q_norm = np.linalg.norm(query_emb, axis=1, keepdims=True)
+        query_emb = query_emb / (q_norm + 1e-9)
+        vector = query_emb[0].tolist()
+        query_body = {
+            "size": k,
+            "query": {
+                "bool": {
+                    "should": [
+                        {"match": {"text": query_text}},
+                        {"knn": {"embedding": {"vector": vector, "k": k}}},
+                    ],
+                    "minimum_should_match": 1,
+                }
+            },
+        }
+        try:
+            resp = os_client.search(index=OPENSEARCH_INDEX_NAME, body=query_body)
+            hits = resp["hits"]["hits"]
+            results = []
+            for h in hits:
+                doc_score = h["_score"]
+                doc_source = h["_source"]
+                results.append((doc_source, float(doc_score)))
+
+            return results
+        except Exception as e:
+            print(f"[OpenSearchIndexer - Hybrid Search] Search error: {e}")
             return []
 
 
@@ -448,15 +506,16 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
 
 
 # ==============================================================================
-# RAG Model
+# RASS engine logic
 # ==============================================================================
-class RAGModel:
+class RASSEngine:
     """
-    Retrieval-Augmented Generation Model with:
-    - OpenSearch for ANN-based retrieval
-    - Redis for caching
-    - Ollama for embeddings
-    - BlueHive for text generation
+    RASS engine that:
+      - Classifies query intent using DistilBERT
+      - Uses appropriate search method (exact, semantic, or hybrid)
+      - Uses BlueHive for final response
+      - Uses Redis for caching w/ TTL
+      - Saves user queries & answers in Postgres (via Prisma)
     """
 
     def __init__(self):
@@ -509,31 +568,14 @@ class RAGModel:
         await loop.run_in_executor(None, self.os_indexer.add_embeddings, embs, all_docs)
         print("[RAGModel] Finished embedding & indexing data in OpenSearch.")
 
-    def os_search(self, query_emb: np.ndarray, top_k: int = 3):
-        """
-        Synchronous call to OpenSearch indexer for approximate k-NN retrieval.
-        """
-        if not self.os_indexer:
-            return []
-
-        return self.os_indexer.search(query_emb, k=top_k)
-
     async def ask(
         self,
         query: str,
-        user_id: str = None,
-        chat_id: str = None,
+        user_id: str,
+        chat_id: str,
         top_k: int = 3,
     ) -> str:
-        """
-        Pipeline for a user query:
-          1) Check if query is empty.
-          2) Embed query, check Redis for a similar query.
-          3) If not cached, retrieve top_k results from OpenSearch.
-          4) Call BlueHive with final combined context.
-          5) Cache new result to Redis.
-          6) Return answer.
-        """
+        # non empty validation check
         if not query.strip():
             return "[ERROR] Empty query."
 
@@ -545,8 +587,12 @@ class RAGModel:
 
         if not chat or chat.userId != user_id:
             raise HTTPException(
-                status_code=403, detail="Chat not found or unauthorized access"
+                status_code=403, detail="Chat not found or unauthorized"
             )
+
+        # DistilBERT classification => "SEMANTIC", "KEYWORD", or "HYBRID"
+        intent = intent_classifier.classify_intent(query)
+        print(f"[Debug] Query Intent = {intent}")
 
         # fetch last 'MAX_CHAT_HISTORY' messages for context
         messages = await db.message.find_many(
@@ -557,7 +603,7 @@ class RAGModel:
 
         # build chat history
         # newest message is first => reverse to chronological
-        messages.reverse()
+        messages.reverse()  # asc order
         chat_history_str = ""
         for m in messages:
             role_label = "User" if m.role == "user" else "AI"
@@ -578,7 +624,13 @@ class RAGModel:
             return cached_resp
 
         # OpenSearch Retrieval
-        partial_results = self.os_search(query_emb, top_k)
+        if intent == "SEMANTIC":
+            partial_results = self.os_indexer.semantic_search(query_emb, k=top_k)
+        elif intent == "KEYWORD":
+            partial_results = self.os_indexer.exact_match_search(query, k=top_k)
+        else:
+            partial_results = self.os_indexer.hybrid_search(query, query_emb, k=top_k)
+
         context_map = {}
         for doc_dict, _score in partial_results:
             doc_id = doc_dict["doc_id"]
@@ -638,12 +690,12 @@ class RAGModel:
 async def lifespan(app: FastAPI):
     # Handles database connection lifecycle
     await db.connect()
-    print("[Lifespan] Initializing RAGModel...")
-    global rag_model
-    rag_model = RAGModel()
+    print("[Lifespan] Initializing RASSEngine...")
+    global rass_engine
+    rass_engine = RASSEngine()
 
-    await rag_model.build_embeddings_from_scratch(EMB_DIR)
-    print("[Lifespan] RAGModel is ready.")
+    await rass_engine.build_embeddings_from_scratch(EMB_DIR)
+    print("[Lifespan] RASSEngine is ready.")
     yield
     print("[Lifespan] Server is shutting down...")
     await db.disconnect()
@@ -659,8 +711,8 @@ app = FastAPI(
 app.router.lifespan_context = lifespan
 
 
-def get_rag_model() -> RAGModel:
-    return rag_model
+def get_rass_engine() -> RASSEngine:
+    return rass_engine
 
 
 @app.post("/ask")
@@ -676,16 +728,16 @@ async def ask_route(payload: dict = Body(...)):
     query: str = payload.get("query", "")
     user_id = payload.get("user_id", "")
     chat_id = payload.get("chat_id", "")
-    if not user_id or not chat_id or not query.strip():
-        raise HTTPException(
-            status_code=400, detail="Must provide user_id, chat_id, query"
-        )
-
     top_k = int(payload.get("top_k", 3))
 
-    print(f"[Debug] query = {query}, top_k = {top_k}")
+    if not user_id or not chat_id or not query.strip():
+        raise HTTPException(status_code=400, detail="Provide user_id, chat_id, query")
 
-    rm = get_rag_model()
+    print(
+        f"[Debug] query = {query}, user_id={user_id}, chat_id={chat_id}, top_k = {top_k}"
+    )
+
+    rm = get_rass_engine()
     if not rm:
         return {"error": "RAGModel not initialized"}
 
@@ -745,7 +797,7 @@ async def ask_websocket_endpoint(websocket: WebSocket):
             return
 
         top_k = data.get("top_k", 3)
-        rm = get_rag_model()
+        rm = get_rass_engine()
         if not rm:
             await websocket.send_text(json.dumps({"error": "RAGModel not initialized"}))
             await websocket.close()
