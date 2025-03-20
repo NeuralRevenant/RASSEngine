@@ -11,6 +11,9 @@ import httpx
 import uvicorn
 import redis.asyncio as aioredis
 
+import concurrent.futures
+import time
+
 from prisma import Prisma
 
 import openai
@@ -27,6 +30,8 @@ from fastapi import (
 from opensearchpy import OpenSearch, RequestsHttpConnection
 from opensearchpy.helpers import bulk
 
+from transformers import pipeline
+
 
 # Load .env file
 load_dotenv()
@@ -34,15 +39,18 @@ load_dotenv()
 # ==============================================================================
 # Global Constants & Configuration
 # ==============================================================================
-OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://localhost:11434/api")
 EMBED_MODEL_NAME = os.getenv("OLLAMA_EMBED_MODEL", "mxbai-embed-large:latest")
+QUERY_INTENT_CLASSIFICATION_MODEL = os.getenv(
+    "QUERY_INTENT_CLASSIFICATION_MODEL", "facebook/bart-large-mnli"
+)
 
 MAX_BLUEHIVE_CONCURRENCY = int(os.getenv("MAX_BLUEHIVE_CONCURRENCY", 5))
 MAX_EMBED_CONCURRENCY = int(os.getenv("MAX_EMBED_CONCURRENCY", 5))
 
 BLUEHIVE_BEARER_TOKEN = os.getenv("BLUEHIVE_BEARER_TOKEN", "")
-BLUEHIVE_API_URL = os.getenv("BLUEHIVEAI_URL", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+BLUEHIVE_API_URL = os.getenv("BLUEHIVEAI_URL", "")
+OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://localhost:11434/api")
 
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", 64))
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 512))
@@ -98,9 +106,6 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
         return 0.0
 
     return float(np.dot(a, b) / (norm_a * norm_b))
-
-
-import time
 
 
 async def lfu_cache_get(query_emb: np.ndarray) -> Optional[str]:
@@ -297,10 +302,9 @@ async def bluehive_generate_text(prompt: str, system_msg: str = "") -> str:
         return None
 
 
-# ==============================================================================
+# ==============================================================
 # OpenSearch Retrieval
-# ==============================================================================
-
+# =====================================================
 os_client: Optional[OpenSearch] = None
 try:
     os_client = OpenSearch(
@@ -505,6 +509,44 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
     return chunks
 
 
+# ----------------------------------------------------------------------
+# ZeroShotQueryClassifier
+# ---------------------------------------------------------
+class ZeroShotQueryClassifier:
+    """
+    A zero-shot classification approach for dynamic labeling of queries like:
+    - "SEMANTIC" => Vector-based search
+    - "KEYWORD"  => Exact / BM25 search
+    - "HYBRID"   => Combination
+    """
+
+    def __init__(self):
+        self.candidate_labels = ["SEMANTIC", "KEYWORD", "HYBRID"]
+        # Create pipeline
+        self._pipe = pipeline(
+            task="zero-shot-classification",
+            model=QUERY_INTENT_CLASSIFICATION_MODEL,
+            tokenizer=QUERY_INTENT_CLASSIFICATION_MODEL,
+        )
+        # Thread executor to avoid blocking
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+    def _sync_classify(self, query: str) -> str:
+        classification = self._pipe(
+            sequences=query, candidate_labels=self.candidate_labels, multi_label=False
+        )
+        return classification["labels"][0]
+
+    async def classify_intent(self, query: str) -> str:
+        loop = asyncio.get_running_loop()
+        label = await loop.run_in_executor(self._executor, self._sync_classify, query)
+        return label
+
+
+# a single global classifier created
+intent_classifier = ZeroShotQueryClassifier()
+
+
 # ==============================================================================
 # RASS engine logic
 # ==============================================================================
@@ -529,14 +571,14 @@ class RASSEngine:
         obtains embeddings, and indexes them in OpenSearch.
         """
         if not self.os_indexer:
-            print("[RAGModel] No OpenSearchIndexer => cannot build embeddings.")
+            print("[RASSEngine] No OpenSearchIndexer => cannot build embeddings.")
             return
 
         if self.os_indexer.has_any_data():
-            print("[RAGModel] OpenSearch already has data. Skipping embedding.")
+            print("[RASSEngine] OpenSearch already has data. Skipping embedding.")
             return
 
-        print("[RAGModel] Building embeddings from scratch...")
+        print("[RASSEngine] Building embeddings from scratch...")
         data_files = os.listdir(pmc_dir)
         all_docs = []
 
@@ -556,17 +598,17 @@ class RASSEngine:
                     all_docs.append({"doc_id": fname, "text": chunk_str})
 
         if not all_docs:
-            print("[RAGModel] No text found in directory. Exiting.")
+            print("[RASSEngine] No text found in directory. Exiting.")
             return
 
-        print(f"[RAGModel] Generating embeddings for {len(all_docs)} chunks...")
+        print(f"[RASSEngine] Generating embeddings for {len(all_docs)} chunks...")
         chunk_texts = [d["text"] for d in all_docs]
 
         embs = await embed_texts_in_batches(chunk_texts, batch_size=64)
 
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self.os_indexer.add_embeddings, embs, all_docs)
-        print("[RAGModel] Finished embedding & indexing data in OpenSearch.")
+        print("[RASSEngine] Finished embedding & indexing data in OpenSearch.")
 
     async def ask(
         self,
@@ -590,8 +632,8 @@ class RASSEngine:
                 status_code=403, detail="Chat not found or unauthorized"
             )
 
-        # DistilBERT classification => "SEMANTIC", "KEYWORD", or "HYBRID"
-        intent = intent_classifier.classify_intent(query)
+        # DistilBERT zero shot classification => "SEMANTIC", "KEYWORD", or "HYBRID"
+        intent = await intent_classifier.classify_intent(query)
         print(f"[Debug] Query Intent = {intent}")
 
         # fetch last 'MAX_CHAT_HISTORY' messages for context
@@ -620,7 +662,7 @@ class RASSEngine:
             await db.message.create(
                 data={"chatId": chat_id, "role": "assistant", "content": cached_resp}
             )
-            print("[RAGModel] Found a similar query in Redis. Returning cached result.")
+            print("[CACHE-HIT] returning cached result.")
             return cached_resp
 
         # OpenSearch Retrieval
@@ -737,11 +779,11 @@ async def ask_route(payload: dict = Body(...)):
         f"[Debug] query = {query}, user_id={user_id}, chat_id={chat_id}, top_k = {top_k}"
     )
 
-    rm = get_rass_engine()
-    if not rm:
-        return {"error": "RAGModel not initialized"}
+    rass_engine = get_rass_engine()
+    if not rass_engine:
+        return {"error": "RASS engine not initialized"}
 
-    answer = await rm.ask(query, user_id, chat_id, top_k)
+    answer = await rass_engine.ask(query, user_id, chat_id, top_k)
     return {"query": query, "answer": answer}
 
 
@@ -782,38 +824,94 @@ async def openai_generate_text_stream(
 @app.websocket("/ws/ask")
 async def ask_websocket_endpoint(websocket: WebSocket):
     """
-    WebSocket endpoint for streaming RAG-based answers token-by-token.
-    Expects the client to send JSON: {"query": "...", "top_k": int}.
+    WebSocket endpoint for streaming answers token-by-token.
+    Expects JSON from the client {'query':str, 'user_id':str, 'chat_id':str, 'top_k':int}
     """
     await websocket.accept()
     try:
-        # Receive JSON from the client (the query + optional top_k)
+        # Receive & parse JSON data
         data_str = await websocket.receive_text()
         data = json.loads(data_str)
+
+        user_id: str = data.get("user_id", "")
+        chat_id: str = data.get("chat_id", "")
         query: str = data.get("query", "")
-        if not query.strip():
-            await websocket.send_text("[ERROR] Empty query.")
+        top_k: int = int(data.get("top_k", 3))
+
+        # validate required fields
+        if not query.strip() or not user_id or not chat_id:
+            await websocket.send_text(
+                json.dumps({"error": "Missing required parameters."})
+            )
             await websocket.close()
             return
 
-        top_k = data.get("top_k", 3)
-        rm = get_rass_engine()
-        if not rm:
-            await websocket.send_text(json.dumps({"error": "RAGModel not initialized"}))
+        print(
+            f"[WebSocket Debug] user_id={user_id}, chat_id={chat_id}, query={query}, top_k={top_k}"
+        )
+
+        # RASS engine instance init
+        rass_engine = get_rass_engine()
+        if not rass_engine:
+            await websocket.send_text(
+                json.dumps({"error": "RASS engine not initialized"})
+            )
             await websocket.close()
             return
 
-        # Check Redis cache first
+        # verify user owns chat
+        chat = await db.chat.find_unique(where={"id": chat_id}, include={"user": True})
+        if not chat or chat.userId != user_id:
+            await websocket.send_text(
+                json.dumps({"error": "Chat not found or unauthorized access."})
+            )
+            await websocket.close()
+            return
+
+        # Fetch chat history
+        messages = await db.message.find_many(
+            where={"chatId": chat_id},
+            order={"createdAt": "desc"},
+            take=MAX_CHAT_HISTORY,
+        )
+
+        messages.reverse()  # asc order
+        chat_history_str = ""
+        for m in messages:
+            role_label = "User" if m.role == "user" else "AI"
+            chat_history_str += f"{role_label}: {m.content}\n"
+
+        # embed & check cache
         query_emb = await embed_query(query)
-        cached_resp = lfu_cache_get(query_emb)
+        cached_resp = await lfu_cache_get(query_emb)
         if cached_resp:
-            # If there's a cached response, just send it either all at once or chunked
+            # save query and cached resp in DB
+            await db.message.create(
+                data={"chatId": chat_id, "role": "user", "content": query}
+            )
+            await db.message.create(
+                data={"chatId": chat_id, "role": "assistant", "content": cached_resp}
+            )
             await websocket.send_text(cached_resp)
             await websocket.close()
+            print("[WebSocket CACHE-HIT] Returned cached response.")
             return
 
-        # Perform retrieval from OpenSearch
-        partial_results = rm.os_search(query_emb, top_k)
+        # zero-shot classify intent asynchronously
+        intent = await intent_classifier.classify_intent(query)
+        print(f"[WebSocket Debug] Query Intent = {intent}")
+
+        # perform retrieval based on intent
+        if intent == "SEMANTIC":
+            partial_results = rass_engine.os_indexer.semantic_search(query_emb, k=3)
+        elif intent == "KEYWORD":
+            partial_results = rass_engine.os_indexer.exact_match_search(query, k=3)
+        else:  # hyb
+            partial_results = rass_engine.os_indexer.hybrid_search(
+                query, query_emb, k=3
+            )
+
+        # Build contxt
         context_map = {}
         for doc_dict, _score in partial_results:
             doc_id = doc_dict["doc_id"]
@@ -823,23 +921,25 @@ async def ask_websocket_endpoint(websocket: WebSocket):
             else:
                 context_map[doc_id] += "\n" + text_chunk
 
-        # build the context prompt
         context_text = ""
         for doc_id, doc_content in context_map.items():
             print(doc_id)
             context_text += f"--- Document ID: {doc_id} ---\n{doc_content}\n\n"
 
+        # build the prompt with chat history and current query
         system_msg = (
             "You are a helpful AI assistant chatbot. You must follow these rules:\n"
             "1) Always cite document IDs from the context exactly as 'Document XYZ' without any file extensions like '.txt'.\n"
             "2) For every answer generated, there should be a reference or citation of the IDs of the documents from which the answer information was extracted at the end of the answer!\n"
             "3) If the context does not relate to the query, say 'I lack the context to answer your question.' For example, if the query is about gene mutations but the context is about climate change, acknowledge the mismatch and do not answer.\n"
-            "4) Never ever give responses based on your own knowledge of the user query. Only use the provided context to extract information relevant to the question. You should not answer without document ID references from which the information was extracted.\n"
+            "4) Never ever give responses based on your own knowledge of the user query. Use ONLY the provided context + chat history to extract information relevant to the question. You should not answer without document ID references from which the information was extracted.\n"
             "5) If you lack context, then say so.\n"
             "6) Do not add chain-of-thought.\n"
             # "7) Answer in at most 4 sentences.\n"
         )
+
         final_prompt = (
+            f"Chat History:\n{chat_history_str}\n\n"
             f"User Query:\n{query}\n\n"
             f"Context:\n{context_text}\n"
             "--- End of context ---\n\n"
@@ -850,13 +950,21 @@ async def ask_websocket_endpoint(websocket: WebSocket):
         streamed_chunks = []
         async for chunk in openai_generate_text_stream(final_prompt, system_msg):
             streamed_chunks.append(chunk)
-            # Send each chunk immediately to the client
+            # send/stream each chunk immediately to the client
             await websocket.send_text(chunk)
 
         # After finishing, store the full response in Redis
-        final_answer = "".join(streamed_chunks)
-        if final_answer.strip():
-            lfu_cache_put(query_emb, final_answer)
+        final_answer = "".join(streamed_chunks).strip()
+        if final_answer:
+            # Store query & answer/resp in DB
+            await db.message.create(
+                data={"chatId": chat_id, "role": "user", "content": query}
+            )
+            await db.message.create(
+                data={"chatId": chat_id, "role": "assistant", "content": final_answer}
+            )
+            # Cache the response
+            await lfu_cache_put(query_emb, final_answer)
 
         await websocket.close()
 
@@ -864,6 +972,9 @@ async def ask_websocket_endpoint(websocket: WebSocket):
         print("[WebSocket] Client disconnected mid-stream.")
     except Exception as e:
         print(f"[WebSocket] Unexpected error: {e}")
+        await websocket.send_text(
+            json.dumps({"error": "Internal server error occurred."})
+        )
         await websocket.close()
 
 
