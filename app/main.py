@@ -319,11 +319,152 @@ try:
 
     if not os_client.indices.exists(OPENSEARCH_INDEX_NAME):
         index_body = {
-            "settings": {"index": {"knn": True}},
+            "settings": {"index": {"knn": True}},  # for vector search
             "mappings": {
                 "properties": {
+                    # ----------------------------------------------------------------
+                    # Core Identifiers & Document Typing
+                    # ----------------------------------------------------------------
                     "doc_id": {"type": "keyword"},
-                    "text": {"type": "text"},
+                    "doc_type": {"type": "keyword"},
+                    "resourceType": {"type": "keyword"},
+                    # ----------------------------------------------------------------
+                    # FHIR "Patient" resource fields
+                    # ----------------------------------------------------------------
+                    "patientId": {"type": "keyword"},
+                    "patientName": {"type": "text"},
+                    "patientGender": {"type": "keyword"},
+                    "patientDOB": {
+                        "type": "date",
+                        "format": "yyyy-MM-dd||strict_date_optional_time||epoch_millis",
+                    },
+                    "patientAddress": {"type": "text"},
+                    "patientMaritalStatus": {"type": "keyword"},
+                    "patientMultipleBirth": {"type": "integer"},
+                    "patientTelecom": {"type": "text"},
+                    "patientLanguage": {"type": "keyword"},
+                    # ----------------------------------------------------------------
+                    # FHIR "Condition" resource fields
+                    # ----------------------------------------------------------------
+                    "conditionId": {"type": "keyword"},
+                    "conditionCodeText": {"type": "text"},
+                    "conditionCategory": {"type": "keyword"},
+                    "conditionClinicalStatus": {"type": "keyword"},
+                    "conditionVerificationStatus": {"type": "keyword"},
+                    "conditionOnsetDateTime": {
+                        "type": "date",
+                        "format": "date_time||strict_date_optional_time||epoch_millis",
+                    },
+                    "conditionRecordedDate": {
+                        "type": "date",
+                        "format": "date_time||strict_date_optional_time||epoch_millis",
+                    },
+                    "conditionSeverity": {"type": "keyword"},
+                    "conditionNote": {"type": "text"},
+                    # ----------------------------------------------------------------
+                    # FHIR "Observation" resource fields
+                    # ----------------------------------------------------------------
+                    "observationId": {"type": "keyword"},
+                    "observationCodeText": {"type": "text"},
+                    "observationValue": {"type": "text"},
+                    "observationUnit": {"type": "keyword"},
+                    "observationInterpretation": {"type": "keyword"},
+                    "observationEffectiveDateTime": {
+                        "type": "date",
+                        "format": "date_time||strict_date_optional_time||epoch_millis",
+                    },
+                    "observationIssued": {
+                        "type": "date",
+                        "format": "date_time||strict_date_optional_time||epoch_millis",
+                    },
+                    "observationReferenceRange": {"type": "text"},
+                    "observationNote": {"type": "text"},
+                    # ----------------------------------------------------------------
+                    # FHIR "Encounter" resource fields
+                    # ----------------------------------------------------------------
+                    "encounterId": {"type": "keyword"},
+                    "encounterStatus": {"type": "keyword"},
+                    "encounterClass": {"type": "keyword"},
+                    "encounterType": {"type": "text"},
+                    "encounterReasonCode": {"type": "text"},
+                    "encounterStart": {
+                        "type": "date",
+                        "format": "date_time||strict_date_optional_time||epoch_millis",
+                    },
+                    "encounterEnd": {
+                        "type": "date",
+                        "format": "date_time||strict_date_optional_time||epoch_millis",
+                    },
+                    "encounterLocation": {"type": "text"},
+                    "encounterServiceProvider": {"type": "keyword"},
+                    "encounterParticipant": {"type": "text"},
+                    "encounterNote": {"type": "text"},
+                    # ----------------------------------------------------------------
+                    # FHIR "MedicationRequest" resource fields
+                    # ----------------------------------------------------------------
+                    "medRequestId": {"type": "keyword"},
+                    "medRequestMedicationDisplay": {"type": "text"},
+                    "medRequestAuthoredOn": {
+                        "type": "date",
+                        "format": "date_time||strict_date_optional_time||epoch_millis",
+                    },
+                    "medRequestIntent": {"type": "keyword"},
+                    "medRequestStatus": {"type": "keyword"},
+                    "medRequestPriority": {"type": "keyword"},
+                    "medRequestDosageInstruction": {"type": "text"},
+                    "medRequestDispenseRequest": {"type": "text"},
+                    "medRequestNote": {"type": "text"},
+                    # ----------------------------------------------------------------
+                    # FHIR "Procedure" resource fields
+                    # ----------------------------------------------------------------
+                    "procedureId": {"type": "keyword"},
+                    "procedureCodeText": {"type": "text"},
+                    "procedureStatus": {"type": "keyword"},
+                    "procedurePerformedDateTime": {
+                        "type": "date",
+                        "format": "date_time||strict_date_optional_time||epoch_millis",
+                    },
+                    "procedureFollowUp": {"type": "text"},
+                    "procedureNote": {"type": "text"},
+                    # ----------------------------------------------------------------
+                    # FHIR "AllergyIntolerance" resource fields
+                    # ----------------------------------------------------------------
+                    "allergyId": {"type": "keyword"},
+                    "allergyClinicalStatus": {"type": "keyword"},
+                    "allergyVerificationStatus": {"type": "keyword"},
+                    "allergyType": {"type": "keyword"},
+                    "allergyCategory": {"type": "keyword"},
+                    "allergyCriticality": {"type": "keyword"},
+                    "allergyCodeText": {"type": "text"},
+                    "allergyOnsetDateTime": {
+                        "type": "date",
+                        "format": "date_time||strict_date_optional_time||epoch_millis",
+                    },
+                    "allergyNote": {"type": "text"},
+                    # ----------------------------------------------------------------
+                    # FHIR "Practitioner" resource fields
+                    # ----------------------------------------------------------------
+                    "practitionerId": {"type": "keyword"},
+                    "practitionerName": {"type": "text"},
+                    "practitionerGender": {"type": "keyword"},
+                    "practitionerSpecialty": {"type": "keyword"},
+                    "practitionerAddress": {"type": "text"},
+                    "practitionerTelecom": {"type": "text"},
+                    # ----------------------------------------------------------------
+                    # FHIR "Organization" resource fields
+                    # ----------------------------------------------------------------
+                    "organizationId": {"type": "keyword"},
+                    "organizationName": {"type": "text"},
+                    "organizationType": {"type": "keyword"},
+                    "organizationAddress": {"type": "text"},
+                    "organizationTelecom": {"type": "text"},
+                    # ----------------------------------------------------------------
+                    # Additional unstructured text from FHIR (like resource.text.div, resource.note[].text, etc.)
+                    # ----------------------------------------------------------------
+                    "unstructuredText": {"type": "text"},
+                    # ----------------------------------------------------------------
+                    # Vector embedding field for semantic / k-NN search
+                    # ----------------------------------------------------------------
                     "embedding": {
                         "type": "knn_vector",
                         "dimension": EMBED_DIM,
@@ -331,12 +472,13 @@ try:
                             "name": "hnsw",
                             "engine": "nmslib",
                             "space_type": "cosinesimil",
-                            "parameters": {"m": 64, "ef_construction": 500},
+                            "parameters": {"m": 48, "ef_construction": 400},
                         },
                     },
                 }
             },
         }
+
         os_client.indices.create(index=OPENSEARCH_INDEX_NAME, body=index_body)
         print(f"[INFO] Created '{OPENSEARCH_INDEX_NAME}' index.")
     else:
