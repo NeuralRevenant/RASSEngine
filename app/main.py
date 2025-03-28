@@ -488,6 +488,589 @@ except Exception as e:
     os_client = None
 
 
+# ==============================================================================
+# Parsing FHIR Bundle
+# ==============================================================================
+def parse_fhir_bundle(bundle_json: Dict) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Returns two lists:
+      1) structured_docs: array of dicts with typed FHIR fields
+      2) unstructured_docs: array of dicts for narrative text (to embed)
+    Each resource may produce:
+      - One doc capturing structured fields (doc_type='structured')
+      - One or more doc(s) capturing unstructured text (doc_type='unstructured')
+
+    We handle multiple resource types: Patient, Condition, Observation, Encounter,
+    MedicationRequest, Procedure, AllergyIntolerance, Practitioner, Organization, etc.
+    We gather text from resource.text.div, resource.note, etc. for the unstructured docs.
+    """
+    structured_docs = []
+    unstructured_docs = []
+
+    if not bundle_json or "entry" not in bundle_json:
+        return (structured_docs, unstructured_docs)
+
+    for entry in bundle_json["entry"]:
+        resource = entry.get("resource", {})
+        rtype = resource.get("resourceType", "")
+        rid = resource.get("id", "")
+
+        # create a 'structured doc' capturing typed fields:
+        sdoc = {
+            "doc_id": f"{rtype}-{rid}-structured",
+            "doc_type": "structured",
+            "resourceType": rtype,
+            # Patient
+            "patientId": None,
+            "patientName": None,
+            "patientGender": None,
+            "patientDOB": None,
+            "patientAddress": None,
+            "patientMaritalStatus": None,
+            "patientMultipleBirth": None,
+            "patientTelecom": None,
+            "patientLanguage": None,
+            # Condition
+            "conditionId": None,
+            "conditionCodeText": None,
+            "conditionCategory": None,
+            "conditionClinicalStatus": None,
+            "conditionVerificationStatus": None,
+            "conditionOnsetDateTime": None,
+            "conditionRecordedDate": None,
+            "conditionSeverity": None,
+            "conditionNote": None,
+            # Observation
+            "observationId": None,
+            "observationCodeText": None,
+            "observationValue": None,
+            "observationUnit": None,
+            "observationInterpretation": None,
+            "observationEffectiveDateTime": None,
+            "observationIssued": None,
+            "observationReferenceRange": None,
+            "observationNote": None,
+            # Encounter
+            "encounterId": None,
+            "encounterStatus": None,
+            "encounterClass": None,
+            "encounterType": None,
+            "encounterReasonCode": None,
+            "encounterStart": None,
+            "encounterEnd": None,
+            "encounterLocation": None,
+            "encounterServiceProvider": None,
+            "encounterParticipant": None,
+            "encounterNote": None,
+            # MedicationRequest
+            "medRequestId": None,
+            "medRequestMedicationDisplay": None,
+            "medRequestAuthoredOn": None,
+            "medRequestIntent": None,
+            "medRequestStatus": None,
+            "medRequestPriority": None,
+            "medRequestDosageInstruction": None,
+            "medRequestDispenseRequest": None,
+            "medRequestNote": None,
+            # Procedure
+            "procedureId": None,
+            "procedureCodeText": None,
+            "procedureStatus": None,
+            "procedurePerformedDateTime": None,
+            "procedureFollowUp": None,
+            "procedureNote": None,
+            # AllergyIntolerance
+            "allergyId": None,
+            "allergyClinicalStatus": None,
+            "allergyVerificationStatus": None,
+            "allergyType": None,
+            "allergyCategory": None,
+            "allergyCriticality": None,
+            "allergyCodeText": None,
+            "allergyOnsetDateTime": None,
+            "allergyNote": None,
+            # Practitioner
+            "practitionerId": None,
+            "practitionerName": None,
+            "practitionerGender": None,
+            "practitionerSpecialty": None,
+            "practitionerAddress": None,
+            "practitionerTelecom": None,
+            # Organization
+            "organizationId": None,
+            "organizationName": None,
+            "organizationType": None,
+            "organizationAddress": None,
+            "organizationTelecom": None,
+            # We do not store embeddings in structured docs
+            # unstructured docs will have "embedding" once we embed them
+        }
+
+        # gather unstructured text from various narrative or note fields
+        unstructured_text_pieces = []
+
+        # resource.text.div
+        div_text = resource.get("text", {}).get("div", "")
+        if div_text.strip():
+            unstructured_text_pieces.append(div_text)
+
+        # now parse resource-specific logic:
+        if rtype == "Patient":
+            sdoc["patientId"] = rid
+            sdoc["patientGender"] = resource.get("gender")
+            sdoc["patientDOB"] = resource.get("birthDate")
+
+            if "name" in resource and len(resource["name"]) > 0:
+                n = resource["name"][0]
+                family = n.get("family", "")
+                given = " ".join(n.get("given", []))
+                sdoc["patientName"] = f"{given} {family}".strip()
+
+            # address
+            if "address" in resource and len(resource["address"]) > 0:
+                addr = resource["address"][0]
+                lines = addr.get("line", [])
+                city = addr.get("city", "")
+                state = addr.get("state", "")
+                postal = addr.get("postalCode", "")
+                address_str = " ".join(lines + [city, state, postal]).strip()
+                sdoc["patientAddress"] = address_str
+
+            # maritalStatus
+            if "maritalStatus" in resource:
+                ms = resource["maritalStatus"]
+                sdoc["patientMaritalStatus"] = ms.get("text") or ms.get("coding", [{}])[
+                    0
+                ].get("code")
+
+            # multipleBirth
+            if "multipleBirthInteger" in resource:
+                sdoc["patientMultipleBirth"] = resource["multipleBirthInteger"]
+            elif "multipleBirthBoolean" in resource:
+                # store as 1 or 0 or keep boolean as integer
+                sdoc["patientMultipleBirth"] = (
+                    1 if resource["multipleBirthBoolean"] else 0
+                )
+
+            # telecom
+            if "telecom" in resource:
+                telecom_strs = []
+                for t in resource["telecom"]:
+                    use = t.get("use", "")
+                    val = t.get("value", "")
+                    telecom_strs.append(f"{use}: {val}")
+                if telecom_strs:
+                    sdoc["patientTelecom"] = " | ".join(telecom_strs)
+
+            # language
+            if "communication" in resource and len(resource["communication"]) > 0:
+                # take first
+                comm = resource["communication"][0]
+                c_lang = comm.get("language", {})
+                sdoc["patientLanguage"] = c_lang.get("text") or c_lang.get(
+                    "coding", [{}]
+                )[0].get("code")
+
+        elif rtype == "Condition":
+            sdoc["conditionId"] = rid
+            cstatus = resource.get("clinicalStatus", {})
+            sdoc["conditionClinicalStatus"] = cstatus.get("text") or cstatus.get(
+                "coding", [{}]
+            )[0].get("code")
+
+            vstatus = resource.get("verificationStatus", {})
+            sdoc["conditionVerificationStatus"] = vstatus.get("text") or vstatus.get(
+                "coding", [{}]
+            )[0].get("code")
+
+            # category
+            if "category" in resource and len(resource["category"]) > 0:
+                cat = resource["category"][0]
+                sdoc["conditionCategory"] = cat.get("text") or cat.get("coding", [{}])[
+                    0
+                ].get("code")
+
+            # severity
+            if "severity" in resource:
+                sev = resource["severity"]
+                sdoc["conditionSeverity"] = sev.get("text") or sev.get("coding", [{}])[
+                    0
+                ].get("code")
+
+            code_field = resource.get("code", {})
+            ctext = code_field.get("text")
+            if not ctext and "coding" in code_field and len(code_field["coding"]) > 0:
+                ctext = code_field["coding"][0].get("display", "")
+            sdoc["conditionCodeText"] = ctext
+
+            sdoc["conditionOnsetDateTime"] = resource.get("onsetDateTime")
+            sdoc["conditionRecordedDate"] = resource.get("recordedDate")
+
+            # Condition note => unstructured
+            if "note" in resource:
+                all_notes = []
+                for note_item in resource["note"]:
+                    note_txt = note_item.get("text", "").strip()
+                    if note_txt:
+                        all_notes.append(note_txt)
+                if all_notes:
+                    sdoc["conditionNote"] = " | ".join(all_notes)
+                    unstructured_text_pieces.extend(all_notes)
+
+        elif rtype == "Observation":
+            sdoc["observationId"] = rid
+            code_info = resource.get("code", {})
+            obs_code_text = code_info.get("text")
+            if (
+                not obs_code_text
+                and "coding" in code_info
+                and len(code_info["coding"]) > 0
+            ):
+                obs_code_text = code_info["coding"][0].get("display", "")
+            sdoc["observationCodeText"] = obs_code_text
+
+            # quantity
+            if "valueQuantity" in resource:
+                val = resource["valueQuantity"].get("value", "")
+                un = resource["valueQuantity"].get("unit", "")
+                sdoc["observationValue"] = str(val)
+                sdoc["observationUnit"] = un
+
+            if "interpretation" in resource and len(resource["interpretation"]) > 0:
+                first_interp = resource["interpretation"][0]
+                sdoc["observationInterpretation"] = first_interp.get(
+                    "text"
+                ) or first_interp.get("coding", [{}])[0].get("code")
+
+            sdoc["observationEffectiveDateTime"] = resource.get("effectiveDateTime")
+            sdoc["observationIssued"] = resource.get("issued")
+
+            if "referenceRange" in resource and len(resource["referenceRange"]) > 0:
+                # store them as text
+                range_list = []
+                for rr in resource["referenceRange"]:
+                    low = rr.get("low", {}).get("value", "")
+                    high = rr.get("high", {}).get("value", "")
+                    range_str = f"Low: {low}, High: {high}".strip()
+                    range_list.append(range_str)
+                if range_list:
+                    sdoc["observationReferenceRange"] = " ; ".join(range_list)
+
+            if "note" in resource:
+                obs_notes = []
+                for nt in resource["note"]:
+                    t = nt.get("text", "").strip()
+                    if t:
+                        obs_notes.append(t)
+                if obs_notes:
+                    sdoc["observationNote"] = " | ".join(obs_notes)
+                    unstructured_text_pieces.extend(obs_notes)
+
+        elif rtype == "Encounter":
+            sdoc["encounterId"] = rid
+            sdoc["encounterStatus"] = resource.get("status")
+            sdoc["encounterClass"] = resource.get("class", {}).get("code")
+            if "type" in resource and len(resource["type"]) > 0:
+                t = resource["type"][0]
+                sdoc["encounterType"] = t.get("text") or t.get("coding", [{}])[0].get(
+                    "display"
+                )
+
+            if "reasonCode" in resource and len(resource["reasonCode"]) > 0:
+                rc = resource["reasonCode"][0]
+                sdoc["encounterReasonCode"] = rc.get("text") or rc.get("coding", [{}])[
+                    0
+                ].get("display")
+
+            period = resource.get("period", {})
+            sdoc["encounterStart"] = period.get("start")
+            sdoc["encounterEnd"] = period.get("end")
+
+            if "location" in resource and len(resource["location"]) > 0:
+                first_loc = resource["location"][0]
+                loc_display = first_loc.get("location", {}).get("display", "")
+                sdoc["encounterLocation"] = loc_display
+
+            if "serviceProvider" in resource:
+                sp = resource["serviceProvider"]
+                # might be a reference
+                sdoc["encounterServiceProvider"] = sp.get("reference")
+
+            if "participant" in resource and len(resource["participant"]) > 0:
+                participants = []
+                for p in resource["participant"]:
+                    ip = p.get("individual", {})
+                    p_disp = ip.get("display", "")
+                    participants.append(p_disp)
+                if participants:
+                    sdoc["encounterParticipant"] = " | ".join(participants)
+
+            if "note" in resource:
+                enc_notes = []
+                for note_item in resource["note"]:
+                    note_txt = note_item.get("text", "").strip()
+                    if note_txt:
+                        enc_notes.append(note_txt)
+                if enc_notes:
+                    sdoc["encounterNote"] = " | ".join(enc_notes)
+                    unstructured_text_pieces.extend(enc_notes)
+
+        elif rtype == "MedicationRequest":
+            sdoc["medRequestId"] = rid
+            sdoc["medRequestIntent"] = resource.get("intent")
+            sdoc["medRequestStatus"] = resource.get("status")
+            sdoc["medRequestPriority"] = resource.get("priority")
+            sdoc["medRequestAuthoredOn"] = resource.get("authoredOn")
+
+            med_code = resource.get("medicationCodeableConcept", {})
+            med_text = med_code.get("text")
+            if (not med_text) and "coding" in med_code and len(med_code["coding"]) > 0:
+                med_text = med_code["coding"][0].get("display", "")
+            sdoc["medRequestMedicationDisplay"] = med_text
+
+            # dosageInstruction
+            if (
+                "dosageInstruction" in resource
+                and len(resource["dosageInstruction"]) > 0
+            ):
+                d_strs = []
+                for di in resource["dosageInstruction"]:
+                    txt = di.get("text", "")
+                    d_strs.append(txt)
+                if d_strs:
+                    sdoc["medRequestDosageInstruction"] = " | ".join(d_strs)
+
+            # dispenseRequest
+            if "dispenseRequest" in resource:
+                dr = resource["dispenseRequest"]
+                sdoc["medRequestDispenseRequest"] = json.dumps(dr)
+
+            # note
+            if "note" in resource:
+                mr_notes = []
+                for n in resource["note"]:
+                    txt = n.get("text", "").strip()
+                    if txt:
+                        mr_notes.append(txt)
+                if mr_notes:
+                    sdoc["medRequestNote"] = " | ".join(mr_notes)
+                    unstructured_text_pieces.extend(mr_notes)
+
+        elif rtype == "Procedure":
+            sdoc["procedureId"] = rid
+            sdoc["procedureStatus"] = resource.get("status")
+            c = resource.get("code", {})
+            c_text = c.get("text") or c.get("coding", [{}])[0].get("display")
+            sdoc["procedureCodeText"] = c_text
+            if "performedDateTime" in resource:
+                sdoc["procedurePerformedDateTime"] = resource["performedDateTime"]
+            if "followUp" in resource and len(resource["followUp"]) > 0:
+                fu_arr = []
+                for f in resource["followUp"]:
+                    fu_txt = f.get("text", "")
+                    fu_arr.append(fu_txt)
+                if fu_arr:
+                    sdoc["procedureFollowUp"] = " | ".join(fu_arr)
+
+            if "note" in resource:
+                proc_notes = []
+                for n in resource["note"]:
+                    t = n.get("text", "").strip()
+                    if t:
+                        proc_notes.append(t)
+                if proc_notes:
+                    sdoc["procedureNote"] = " | ".join(proc_notes)
+                    unstructured_text_pieces.extend(proc_notes)
+
+        elif rtype == "AllergyIntolerance":
+            sdoc["allergyId"] = rid
+            sdoc["allergyClinicalStatus"] = resource.get("clinicalStatus", {}).get(
+                "text"
+            )
+            sdoc["allergyVerificationStatus"] = resource.get(
+                "verificationStatus", {}
+            ).get("text")
+            sdoc["allergyType"] = resource.get("type")
+            if "category" in resource and len(resource["category"]) > 0:
+                sdoc["allergyCategory"] = resource["category"][0]
+            sdoc["allergyCriticality"] = resource.get("criticality")
+
+            code_field = resource.get("code", {})
+            all_text = code_field.get("text")
+            if (
+                not all_text
+                and "coding" in code_field
+                and len(code_field["coding"]) > 0
+            ):
+                all_text = code_field["coding"][0].get("display", "")
+            sdoc["allergyCodeText"] = all_text
+
+            sdoc["allergyOnsetDateTime"] = resource.get("onsetDateTime")
+
+            if "note" in resource:
+                a_notes = []
+                for note in resource["note"]:
+                    ntxt = note.get("text", "").strip()
+                    if ntxt:
+                        a_notes.append(ntxt)
+                if a_notes:
+                    sdoc["allergyNote"] = " | ".join(a_notes)
+                    unstructured_text_pieces.extend(a_notes)
+
+        elif rtype == "Practitioner":
+            sdoc["practitionerId"] = rid
+            if "name" in resource and len(resource["name"]) > 0:
+                nm = resource["name"][0]
+                p_fam = nm.get("family", "")
+                p_giv = " ".join(nm.get("given", []))
+                sdoc["practitionerName"] = f"{p_giv} {p_fam}".strip()
+            sdoc["practitionerGender"] = resource.get("gender")
+
+            if "qualification" in resource and len(resource["qualification"]) > 0:
+                # interpret "qualification" as specialty
+                q = resource["qualification"][0]
+                sdoc["practitionerSpecialty"] = q.get("code", {}).get("text")
+
+            if "address" in resource and len(resource["address"]) > 0:
+                adr = resource["address"][0]
+                lines = adr.get("line", [])
+                city = adr.get("city", "")
+                state = adr.get("state", "")
+                postal = adr.get("postalCode", "")
+                paddr_str = " ".join(lines + [city, state, postal]).strip()
+                sdoc["practitionerAddress"] = paddr_str
+
+            if "telecom" in resource:
+                tele_arr = []
+                for t in resource["telecom"]:
+                    use = t.get("use", "")
+                    val = t.get("value", "")
+                    tele_arr.append(f"{use}: {val}")
+                if tele_arr:
+                    sdoc["practitionerTelecom"] = " | ".join(tele_arr)
+
+        elif rtype == "Organization":
+            sdoc["organizationId"] = rid
+            sdoc["organizationName"] = resource.get("name")
+            if "type" in resource and len(resource["type"]) > 0:
+                t0 = resource["type"][0]
+                sdoc["organizationType"] = t0.get("text") or t0.get("coding", [{}])[
+                    0
+                ].get("code")
+
+            if "address" in resource and len(resource["address"]) > 0:
+                org_adr = resource["address"][0]
+                lines = org_adr.get("line", [])
+                city = org_adr.get("city", "")
+                state = org_adr.get("state", "")
+                postal = org_adr.get("postalCode", "")
+                org_addr_str = " ".join(lines + [city, state, postal]).strip()
+                sdoc["organizationAddress"] = org_addr_str
+
+            if "telecom" in resource:
+                otele_arr = []
+                for t in resource["telecom"]:
+                    use = t.get("use", "")
+                    val = t.get("value", "")
+                    otele_arr.append(f"{use}: {val}")
+                if otele_arr:
+                    sdoc["organizationTelecom"] = " | ".join(otele_arr)
+
+        # more resource types can be added here later for future uses
+
+        # add the structured doc
+        structured_docs.append(sdoc)
+
+        # If we have unstructured text, chunk it out for embedding
+        # Because these are notes, we set doc_type="unstructured"
+        # Each chunk becomes a separate doc due to chunking
+        if unstructured_text_pieces:
+            combined_text = "\n".join(unstructured_text_pieces).strip()
+            if not combined_text:
+                continue
+
+            # Possibly chunk if large
+            text_chunks = chunk_text(combined_text, chunk_size=CHUNK_SIZE)
+            for c_i, chunk_str in enumerate(text_chunks):
+                udoc = {
+                    "doc_id": f"{rtype}-{rid}-unstructured-{c_i}",
+                    "doc_type": "unstructured",
+                    "resourceType": rtype,
+                    # We'll store the text in "unstructuredText" field
+                    "unstructuredText": chunk_str,
+                }
+                unstructured_docs.append(udoc)
+
+    return (structured_docs, unstructured_docs)
+
+
+async def store_fhir_docs_in_opensearch(
+    structured_docs: List[Dict],
+    unstructured_docs: List[Dict],
+    client: OpenSearch,
+    index_name: str,
+) -> None:
+    """
+    1) Bulk index the structured docs (no embeddings).
+    2) For unstructured docs, embed them => store text + embedding.
+    This aligns with the new index structure that has one text field + embedding field.
+    """
+    if not client:
+        print("[store_fhir_docs_in_opensearch] No OS client.")
+        return
+
+    # Bulk index structured docs
+    bulk_actions_struct = []
+    for doc in structured_docs:
+        # We'll upsert them into the index
+        # (If you want, you can differentiate by doc_type or resourceType here.)
+        action_struct = {
+            "_op_type": "index",
+            "_index": index_name,
+            "_id": doc["doc_id"],
+            "_source": doc,
+        }
+        bulk_actions_struct.append(action_struct)
+
+    if bulk_actions_struct:
+        s_success, s_errors = bulk(client, bulk_actions_struct)
+        print(f"[FHIR] Indexed {s_success} structured docs. Errors: {s_errors}")
+
+    if not unstructured_docs:
+        return
+
+    # We'll embed the unstructured text, then store each doc with
+    # "unstructuredText" plus the "embedding" field.
+    un_texts = [d["unstructuredText"] for d in unstructured_docs]
+    embeddings = await embed_texts_in_batches(un_texts, batch_size=BATCH_SIZE)
+
+    # Normalize embeddings
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    embeddings_normed = embeddings / (norms + 1e-9)
+
+    bulk_actions_unstruct = []
+    for i, docu in enumerate(unstructured_docs):
+        emb_vec = embeddings_normed[i]
+        docu["embedding"] = emb_vec.tolist()  # store as float array
+        # We'll store docu in index, using "doc_id" as _id
+        action_unstruct = {
+            "_op_type": "index",
+            "_index": index_name,
+            "_id": docu["doc_id"],
+            "_source": docu,
+        }
+        bulk_actions_unstruct.append(action_unstruct)
+
+        if len(bulk_actions_unstruct) >= BATCH_SIZE:
+            u_success, u_errors = bulk(client, bulk_actions_unstruct)
+            print(f"[FHIR] Indexed {u_success} unstructured docs. Errors: {u_errors}")
+            bulk_actions_unstruct = []
+
+    if bulk_actions_unstruct:
+        u_success, u_errors = bulk(client, bulk_actions_unstruct)
+        print(f"[FHIR] Indexed {u_success} unstructured docs. Errors: {u_errors}")
+
+
 class OpenSearchIndexer:
     """
     Index documents with embeddings into OpenSearch with a hybrid search approach
@@ -752,6 +1335,46 @@ class RASSEngine:
         await loop.run_in_executor(None, self.os_indexer.add_embeddings, embs, all_docs)
         print("[RASSEngine] Finished embedding & indexing data in OpenSearch.")
 
+    async def ingest_fhir_directory(self, fhir_dir: str) -> None:
+        """
+        Enumerate all FHIR .json files in fhir_dir, parse them, and store in OS.
+        This is production-level logic for hybrid FHIR ingestion.
+        """
+        if not self.os_indexer:
+            print("[RASSEngine] No OS indexer => cannot ingest FHIR data.")
+            return
+
+        all_files = [f for f in os.listdir(fhir_dir) if f.endswith(".json")]
+        if not all_files:
+            print(f"[RASSEngine] No .json files found in {fhir_dir}.")
+            return
+
+        for fname in all_files:
+            path = os.path.join(fhir_dir, fname)
+            print(f"[RASSEngine] Processing FHIR file: {path}")
+
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    bundle_json = json.load(f)
+            except UnicodeDecodeError:
+                with open(path, "r", encoding="latin-1") as f:
+                    bundle_json = json.load(f)
+            except Exception as e:
+                print(f"[ERROR] Failed reading {path}: {e}")
+                continue
+
+            # parse the entire FHIR bundle
+            structured_docs, unstructured_docs = parse_fhir_bundle(bundle_json)
+            # store them in OS
+            await store_fhir_docs_in_opensearch(
+                structured_docs,
+                unstructured_docs,
+                self.os_indexer.client,
+                self.os_indexer.index_name,
+            )
+
+        print("[RASSEngine] Completed ingesting FHIR data from directory.")
+
     async def ask(
         self,
         query: str,
@@ -807,6 +1430,9 @@ class RASSEngine:
             print("[CACHE-HIT] returning cached result.")
             return cached_resp
 
+        if not self.os_indexer:
+            return "[ERROR] No OS indexer"
+
         # OpenSearch Retrieval
         if intent == "SEMANTIC":
             partial_results = self.os_indexer.semantic_search(query_emb, k=top_k)
@@ -817,12 +1443,298 @@ class RASSEngine:
 
         context_map = {}
         for doc_dict, _score in partial_results:
-            doc_id = doc_dict["doc_id"]
-            text_chunk = doc_dict["text"]
-            if doc_id not in context_map:
-                context_map[doc_id] = text_chunk
+            doc_id = doc_dict.get("doc_id", "UNKNOWN")
+
+            if doc_dict.get("doc_type", "structured") == "unstructured":
+                # just show the unstructuredText - improvement may be planned later
+                raw_text = doc_dict.get("unstructuredText", "")
+                snippet = f"[Unstructured Text]: {raw_text}"
             else:
-                context_map[doc_id] += "\n" + text_chunk
+                # gather all non-empty fields for "structured" docs
+                snippet_pieces = []
+
+                # patient
+                if doc_dict.get("patientId"):
+                    snippet_pieces.append(f"patientId={doc_dict['patientId']}")
+                if doc_dict.get("patientName"):
+                    snippet_pieces.append(f"patientName={doc_dict['patientName']}")
+                if doc_dict.get("patientGender"):
+                    snippet_pieces.append(f"patientGender={doc_dict['patientGender']}")
+                if doc_dict.get("patientDOB"):
+                    snippet_pieces.append(f"patientDOB={doc_dict['patientDOB']}")
+                if doc_dict.get("patientAddress"):
+                    snippet_pieces.append(
+                        f"patientAddress={doc_dict['patientAddress']}"
+                    )
+                if doc_dict.get("patientMaritalStatus"):
+                    snippet_pieces.append(
+                        f"patientMaritalStatus={doc_dict['patientMaritalStatus']}"
+                    )
+                if doc_dict.get("patientMultipleBirth") is not None:
+                    snippet_pieces.append(
+                        f"patientMultipleBirth={doc_dict['patientMultipleBirth']}"
+                    )
+                if doc_dict.get("patientTelecom"):
+                    snippet_pieces.append(
+                        f"patientTelecom={doc_dict['patientTelecom']}"
+                    )
+                if doc_dict.get("patientLanguage"):
+                    snippet_pieces.append(
+                        f"patientLanguage={doc_dict['patientLanguage']}"
+                    )
+
+                # Condition
+                if doc_dict.get("conditionId"):
+                    snippet_pieces.append(f"conditionId={doc_dict['conditionId']}")
+                if doc_dict.get("conditionCodeText"):
+                    snippet_pieces.append(
+                        f"conditionCodeText={doc_dict['conditionCodeText']}"
+                    )
+                if doc_dict.get("conditionCategory"):
+                    snippet_pieces.append(
+                        f"conditionCategory={doc_dict['conditionCategory']}"
+                    )
+                if doc_dict.get("conditionClinicalStatus"):
+                    snippet_pieces.append(
+                        f"conditionClinicalStatus={doc_dict['conditionClinicalStatus']}"
+                    )
+                if doc_dict.get("conditionVerificationStatus"):
+                    snippet_pieces.append(
+                        f"conditionVerificationStatus={doc_dict['conditionVerificationStatus']}"
+                    )
+                if doc_dict.get("conditionOnsetDateTime"):
+                    snippet_pieces.append(
+                        f"conditionOnsetDateTime={doc_dict['conditionOnsetDateTime']}"
+                    )
+                if doc_dict.get("conditionRecordedDate"):
+                    snippet_pieces.append(
+                        f"conditionRecordedDate={doc_dict['conditionRecordedDate']}"
+                    )
+                if doc_dict.get("conditionSeverity"):
+                    snippet_pieces.append(
+                        f"conditionSeverity={doc_dict['conditionSeverity']}"
+                    )
+                if doc_dict.get("conditionNote"):
+                    snippet_pieces.append(f"conditionNote={doc_dict['conditionNote']}")
+
+                # Observation
+                if doc_dict.get("observationId"):
+                    snippet_pieces.append(f"observationId={doc_dict['observationId']}")
+                if doc_dict.get("observationCodeText"):
+                    snippet_pieces.append(
+                        f"observationCodeText={doc_dict['observationCodeText']}"
+                    )
+                if doc_dict.get("observationValue"):
+                    snippet_pieces.append(
+                        f"observationValue={doc_dict['observationValue']}"
+                    )
+                if doc_dict.get("observationUnit"):
+                    snippet_pieces.append(
+                        f"observationUnit={doc_dict['observationUnit']}"
+                    )
+                if doc_dict.get("observationInterpretation"):
+                    snippet_pieces.append(
+                        f"observationInterpretation={doc_dict['observationInterpretation']}"
+                    )
+                if doc_dict.get("observationEffectiveDateTime"):
+                    snippet_pieces.append(
+                        f"observationEffectiveDateTime={doc_dict['observationEffectiveDateTime']}"
+                    )
+                if doc_dict.get("observationIssued"):
+                    snippet_pieces.append(
+                        f"observationIssued={doc_dict['observationIssued']}"
+                    )
+                if doc_dict.get("observationReferenceRange"):
+                    snippet_pieces.append(
+                        f"observationReferenceRange={doc_dict['observationReferenceRange']}"
+                    )
+                if doc_dict.get("observationNote"):
+                    snippet_pieces.append(
+                        f"observationNote={doc_dict['observationNote']}"
+                    )
+
+                # Encounter
+                if doc_dict.get("encounterId"):
+                    snippet_pieces.append(f"encounterId={doc_dict['encounterId']}")
+                if doc_dict.get("encounterStatus"):
+                    snippet_pieces.append(
+                        f"encounterStatus={doc_dict['encounterStatus']}"
+                    )
+                if doc_dict.get("encounterClass"):
+                    snippet_pieces.append(
+                        f"encounterClass={doc_dict['encounterClass']}"
+                    )
+                if doc_dict.get("encounterType"):
+                    snippet_pieces.append(f"encounterType={doc_dict['encounterType']}")
+                if doc_dict.get("encounterReasonCode"):
+                    snippet_pieces.append(
+                        f"encounterReasonCode={doc_dict['encounterReasonCode']}"
+                    )
+                if doc_dict.get("encounterStart"):
+                    snippet_pieces.append(
+                        f"encounterStart={doc_dict['encounterStart']}"
+                    )
+                if doc_dict.get("encounterEnd"):
+                    snippet_pieces.append(f"encounterEnd={doc_dict['encounterEnd']}")
+                if doc_dict.get("encounterLocation"):
+                    snippet_pieces.append(
+                        f"encounterLocation={doc_dict['encounterLocation']}"
+                    )
+                if doc_dict.get("encounterServiceProvider"):
+                    snippet_pieces.append(
+                        f"encounterServiceProvider={doc_dict['encounterServiceProvider']}"
+                    )
+                if doc_dict.get("encounterParticipant"):
+                    snippet_pieces.append(
+                        f"encounterParticipant={doc_dict['encounterParticipant']}"
+                    )
+                if doc_dict.get("encounterNote"):
+                    snippet_pieces.append(f"encounterNote={doc_dict['encounterNote']}")
+
+                # MedicationRequest
+                if doc_dict.get("medRequestId"):
+                    snippet_pieces.append(f"medRequestId={doc_dict['medRequestId']}")
+                if doc_dict.get("medRequestMedicationDisplay"):
+                    snippet_pieces.append(
+                        f"medRequestMedicationDisplay={doc_dict['medRequestMedicationDisplay']}"
+                    )
+                if doc_dict.get("medRequestAuthoredOn"):
+                    snippet_pieces.append(
+                        f"medRequestAuthoredOn={doc_dict['medRequestAuthoredOn']}"
+                    )
+                if doc_dict.get("medRequestIntent"):
+                    snippet_pieces.append(
+                        f"medRequestIntent={doc_dict['medRequestIntent']}"
+                    )
+                if doc_dict.get("medRequestStatus"):
+                    snippet_pieces.append(
+                        f"medRequestStatus={doc_dict['medRequestStatus']}"
+                    )
+                if doc_dict.get("medRequestPriority"):
+                    snippet_pieces.append(
+                        f"medRequestPriority={doc_dict['medRequestPriority']}"
+                    )
+                if doc_dict.get("medRequestDosageInstruction"):
+                    snippet_pieces.append(
+                        f"medRequestDosageInstruction={doc_dict['medRequestDosageInstruction']}"
+                    )
+                if doc_dict.get("medRequestDispenseRequest"):
+                    snippet_pieces.append(
+                        f"medRequestDispenseRequest={doc_dict['medRequestDispenseRequest']}"
+                    )
+                if doc_dict.get("medRequestNote"):
+                    snippet_pieces.append(
+                        f"medRequestNote={doc_dict['medRequestNote']}"
+                    )
+
+                # Procedure
+                if doc_dict.get("procedureId"):
+                    snippet_pieces.append(f"procedureId={doc_dict['procedureId']}")
+                if doc_dict.get("procedureCodeText"):
+                    snippet_pieces.append(
+                        f"procedureCodeText={doc_dict['procedureCodeText']}"
+                    )
+                if doc_dict.get("procedureStatus"):
+                    snippet_pieces.append(
+                        f"procedureStatus={doc_dict['procedureStatus']}"
+                    )
+                if doc_dict.get("procedurePerformedDateTime"):
+                    snippet_pieces.append(
+                        f"procedurePerformedDateTime={doc_dict['procedurePerformedDateTime']}"
+                    )
+                if doc_dict.get("procedureFollowUp"):
+                    snippet_pieces.append(
+                        f"procedureFollowUp={doc_dict['procedureFollowUp']}"
+                    )
+                if doc_dict.get("procedureNote"):
+                    snippet_pieces.append(f"procedureNote={doc_dict['procedureNote']}")
+
+                # AllergyIntolerance
+                if doc_dict.get("allergyId"):
+                    snippet_pieces.append(f"allergyId={doc_dict['allergyId']}")
+                if doc_dict.get("allergyClinicalStatus"):
+                    snippet_pieces.append(
+                        f"allergyClinicalStatus={doc_dict['allergyClinicalStatus']}"
+                    )
+                if doc_dict.get("allergyVerificationStatus"):
+                    snippet_pieces.append(
+                        f"allergyVerificationStatus={doc_dict['allergyVerificationStatus']}"
+                    )
+                if doc_dict.get("allergyType"):
+                    snippet_pieces.append(f"allergyType={doc_dict['allergyType']}")
+                if doc_dict.get("allergyCategory"):
+                    snippet_pieces.append(
+                        f"allergyCategory={doc_dict['allergyCategory']}"
+                    )
+                if doc_dict.get("allergyCriticality"):
+                    snippet_pieces.append(
+                        f"allergyCriticality={doc_dict['allergyCriticality']}"
+                    )
+                if doc_dict.get("allergyCodeText"):
+                    snippet_pieces.append(
+                        f"allergyCodeText={doc_dict['allergyCodeText']}"
+                    )
+                if doc_dict.get("allergyOnsetDateTime"):
+                    snippet_pieces.append(
+                        f"allergyOnsetDateTime={doc_dict['allergyOnsetDateTime']}"
+                    )
+                if doc_dict.get("allergyNote"):
+                    snippet_pieces.append(f"allergyNote={doc_dict['allergyNote']}")
+
+                # Practitioner
+                if doc_dict.get("practitionerId"):
+                    snippet_pieces.append(
+                        f"practitionerId={doc_dict['practitionerId']}"
+                    )
+                if doc_dict.get("practitionerName"):
+                    snippet_pieces.append(
+                        f"practitionerName={doc_dict['practitionerName']}"
+                    )
+                if doc_dict.get("practitionerGender"):
+                    snippet_pieces.append(
+                        f"practitionerGender={doc_dict['practitionerGender']}"
+                    )
+                if doc_dict.get("practitionerSpecialty"):
+                    snippet_pieces.append(
+                        f"practitionerSpecialty={doc_dict['practitionerSpecialty']}"
+                    )
+                if doc_dict.get("practitionerAddress"):
+                    snippet_pieces.append(
+                        f"practitionerAddress={doc_dict['practitionerAddress']}"
+                    )
+                if doc_dict.get("practitionerTelecom"):
+                    snippet_pieces.append(
+                        f"practitionerTelecom={doc_dict['practitionerTelecom']}"
+                    )
+
+                # Organization
+                if doc_dict.get("organizationId"):
+                    snippet_pieces.append(
+                        f"organizationId={doc_dict['organizationId']}"
+                    )
+                if doc_dict.get("organizationName"):
+                    snippet_pieces.append(
+                        f"organizationName={doc_dict['organizationName']}"
+                    )
+                if doc_dict.get("organizationType"):
+                    snippet_pieces.append(
+                        f"organizationType={doc_dict['organizationType']}"
+                    )
+                if doc_dict.get("organizationAddress"):
+                    snippet_pieces.append(
+                        f"organizationAddress={doc_dict['organizationAddress']}"
+                    )
+                if doc_dict.get("organizationTelecom"):
+                    snippet_pieces.append(
+                        f"organizationTelecom={doc_dict['organizationTelecom']}"
+                    )
+
+                snippet = "[Structured Resource] " + " | ".join(snippet_pieces)
+
+            if doc_id not in context_map:
+                context_map[doc_id] = snippet
+            else:
+                context_map[doc_id] += "\n" + snippet
 
         # Build a short context
         context_text = ""
@@ -878,7 +1790,7 @@ async def lifespan(app: FastAPI):
     global rass_engine
     rass_engine = RASSEngine()
 
-    await rass_engine.build_embeddings_from_scratch(EMB_DIR)
+    await rass_engine.ingest_fhir_directory(EMB_DIR)
     print("[Lifespan] RASSEngine is ready.")
     yield
     print("[Lifespan] Server is shutting down...")
