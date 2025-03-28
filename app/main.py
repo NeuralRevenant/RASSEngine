@@ -1022,8 +1022,7 @@ async def store_fhir_docs_in_opensearch(
     # Bulk index structured docs
     bulk_actions_struct = []
     for doc in structured_docs:
-        # We'll upsert them into the index
-        # (If you want, you can differentiate by doc_type or resourceType here.)
+        # upsert them into the index
         action_struct = {
             "_op_type": "index",
             "_index": index_name,
@@ -1039,8 +1038,7 @@ async def store_fhir_docs_in_opensearch(
     if not unstructured_docs:
         return
 
-    # We'll embed the unstructured text, then store each doc with
-    # "unstructuredText" plus the "embedding" field.
+    # embed the unstructured text, then store each doc with "unstructuredText" plus the "embedding" field.
     un_texts = [d["unstructuredText"] for d in unstructured_docs]
     embeddings = await embed_texts_in_batches(un_texts, batch_size=BATCH_SIZE)
 
@@ -1099,20 +1097,22 @@ class OpenSearchIndexer:
         embeddings = embeddings / (norms + 1e-9)
 
         for i, (doc_dict, emb) in enumerate(zip(docs, embeddings)):
-            doc_id = doc_dict["doc_id"]
-            text_content = doc_dict["text"]
-            actions.append(
-                {
-                    "_op_type": "index",
-                    "_index": self.index_name,
-                    "_id": f"{doc_id}_{i}",
-                    "_source": {
-                        "doc_id": doc_id,
-                        "text": text_content,
-                        "embedding": emb.tolist(),
-                    },
-                }
-            )
+            doc_id = doc_dict.get("doc_id", "")
+            text_content = doc_dict.get("text", "")
+            source_body = {
+                "doc_id": doc_id,
+                "doc_type": "unstructured",
+                "unstructuredText": text_content,
+                "embedding": emb.tolist(),
+            }
+            action = {
+                "_op_type": "index",
+                "_index": self.index_name,
+                "_id": f"{doc_id}_{i}",
+                "_source": source_body,
+            }
+
+            actions.append(action)
             if len(actions) >= BATCH_SIZE:
                 self._bulk_index(actions)
                 actions = []
@@ -1133,84 +1133,229 @@ class OpenSearchIndexer:
         if not self.client or not query_text.strip():
             return []
 
-        query_body = {"size": k, "query": {"match": {"text": query_text}}}
-        try:
-            resp = self.client.search(index=OPENSEARCH_INDEX_NAME, body=query_body)
-            hits = resp["hits"]["hits"]
-            results = []
-            for h in hits:
-                doc_score = h["_score"]
-                doc_source = h["_source"]
-                results.append((doc_source, float(doc_score)))
+        fields_for_multi_match = [
+            "unstructuredText^3",
+            "patientName",
+            "patientGender",
+            "patientDOB",
+            "patientAddress",
+            "patientMaritalStatus",
+            "patientTelecom",
+            "patientLanguage",
+            "conditionCodeText",
+            "conditionCategory",
+            "conditionClinicalStatus",
+            "conditionVerificationStatus",
+            "conditionOnsetDateTime",
+            "conditionRecordedDate",
+            "conditionSeverity",
+            "conditionNote",
+            "observationCodeText",
+            "observationValue",
+            "observationUnit",
+            "observationInterpretation",
+            "observationEffectiveDateTime",
+            "observationIssued",
+            "observationReferenceRange",
+            "observationNote",
+            "encounterType",
+            "encounterReasonCode",
+            "encounterLocation",
+            "encounterServiceProvider",
+            "encounterParticipant",
+            "encounterNote",
+            "medRequestMedicationDisplay",
+            "medRequestNote",
+            "procedureCodeText",
+            "procedureNote",
+            "allergyCodeText",
+            "allergyNote",
+            "practitionerName",
+            "practitionerGender",
+            "practitionerSpecialty",
+            "practitionerAddress",
+            "practitionerTelecom",
+            "organizationName",
+            "organizationType",
+            "organizationAddress",
+            "organizationTelecom",
+        ]
 
-            return results
-        except Exception as e:
-            print(f"[OpenSearchIndexer - Exact Match] Search error: {e}")
-            return []
-
-    def semantic_search(
-        self, query_emb: np.ndarray, k: int = 3
-    ) -> List[Tuple[Dict[str, str], float]]:
-        if not self.client or query_emb.size == 0:
-            return []
-
-        q_norm = np.linalg.norm(query_emb, axis=1, keepdims=True)
-        query_emb = query_emb / (q_norm + 1e-9)
-        vector = query_emb[0].tolist()
         query_body = {
             "size": k,
-            "query": {"knn": {"embedding": {"vector": vector, "k": k}}},
+            "query": {
+                "multi_match": {
+                    "query": query_text,
+                    "fields": fields_for_multi_match,
+                    "type": "best_fields",
+                    "operator": "and",
+                    "fuzziness": "AUTO",
+                }
+            },
         }
+
         try:
             resp = self.client.search(index=self.index_name, body=query_body)
             hits = resp["hits"]["hits"]
             results = []
-            for h in hits:
-                doc_score = h["_score"]
-                doc_source = h["_source"]
+            for hit in hits:
+                doc_score = hit["_score"]
+                doc_source = hit["_source"]
                 results.append((doc_source, float(doc_score)))
-
-            print(
-                f"[OpenSearchIndexer - Semantic Search] Found {len(results)} relevant results."
-            )
             return results
         except Exception as e:
-            print(f"[OpenSearchIndexer - Semantic Search] Search error: {e}")
+            print(f"[OpenSearchIndexer - exact_match_search] Error: {e}")
+            return []
+
+    def semantic_search(
+        self, query_emb: np.ndarray, k: int = 3, filter_clause: Dict = None
+    ) -> List[Tuple[Dict[str, str], float]]:
+        if not self.client or query_emb.size == 0:
+            return []
+
+        norms = np.linalg.norm(query_emb, axis=1, keepdims=True)
+        query_emb = query_emb / (norms + 1e-9)
+        vector = query_emb[0].tolist()
+
+        if filter_clause:
+            query_body = {
+                "size": k,
+                "query": {
+                    "bool": {
+                        "must": [
+                            {"knn": {"embedding": {"vector": vector, "k": k}}},
+                            filter_clause,
+                        ]
+                    }
+                },
+            }
+        else:
+            query_body = {
+                "size": k,
+                "query": {"knn": {"embedding": {"vector": vector, "k": k}}},
+            }
+
+        try:
+            resp = self.client.search(index=self.index_name, body=query_body)
+            hits = resp["hits"]["hits"]
+            results = []
+            for hit in hits:
+                doc_score = hit["_score"]
+                doc_source = hit["_source"]
+                results.append((doc_source, float(doc_score)))
+            return results
+        except Exception as e:
+            print(f"[OpenSearchIndexer - semantic_search] Error: {e}")
             return []
 
     def hybrid_search(
-        self, query_text: str, query_emb: np.ndarray, k: int = 3
+        self,
+        query_text: str,
+        query_emb: np.ndarray,
+        k: int = 3,
+        filter_clause: Dict = None,
     ) -> List[Tuple[Dict[str, str], float]]:
-        if not self.client or not query_text.strip() or not query_emb:
+        if not self.client or not query_text.strip() or query_emb.size == 0:
             return []
 
-        q_norm = np.linalg.norm(query_emb, axis=1, keepdims=True)
-        query_emb = query_emb / (q_norm + 1e-9)
+        norms = np.linalg.norm(query_emb, axis=1, keepdims=True)
+        query_emb = query_emb / (norms + 1e-9)
         vector = query_emb[0].tolist()
-        query_body = {
-            "size": k,
-            "query": {
-                "bool": {
-                    "should": [
-                        {"match": {"text": query_text}},
-                        {"knn": {"embedding": {"vector": vector, "k": k}}},
-                    ],
-                    "minimum_should_match": 1,
-                }
-            },
+
+        fields_for_multi_match = [
+            "unstructuredText^3",
+            "patientName",
+            "patientGender",
+            "patientDOB",
+            "patientAddress",
+            "patientMaritalStatus",
+            "patientTelecom",
+            "patientLanguage",
+            "conditionCodeText",
+            "conditionCategory",
+            "conditionClinicalStatus",
+            "conditionVerificationStatus",
+            "conditionOnsetDateTime",
+            "conditionRecordedDate",
+            "conditionSeverity",
+            "conditionNote",
+            "observationCodeText",
+            "observationValue",
+            "observationUnit",
+            "observationInterpretation",
+            "observationEffectiveDateTime",
+            "observationIssued",
+            "observationReferenceRange",
+            "observationNote",
+            "encounterType",
+            "encounterReasonCode",
+            "encounterLocation",
+            "encounterServiceProvider",
+            "encounterParticipant",
+            "encounterNote",
+            "medRequestMedicationDisplay",
+            "medRequestNote",
+            "procedureCodeText",
+            "procedureNote",
+            "allergyCodeText",
+            "allergyNote",
+            "practitionerName",
+            "practitionerGender",
+            "practitionerSpecialty",
+            "practitionerAddress",
+            "practitionerTelecom",
+            "organizationName",
+            "organizationType",
+            "organizationAddress",
+            "organizationTelecom",
+        ]
+
+        text_subquery = {
+            "multi_match": {
+                "query": query_text,
+                "fields": fields_for_multi_match,
+                "type": "best_fields",
+                "operator": "and",
+                "fuzziness": "AUTO",
+            }
         }
+
+        knn_subquery = {"knn": {"embedding": {"vector": vector, "k": k}}}
+
+        if filter_clause:
+            query_body = {
+                "size": k,
+                "query": {
+                    "bool": {
+                        "must": [filter_clause],
+                        "should": [text_subquery, knn_subquery],
+                        "minimum_should_match": 1,
+                    }
+                },
+            }
+        else:
+            query_body = {
+                "size": k,
+                "query": {
+                    "bool": {
+                        "should": [text_subquery, knn_subquery],
+                        "minimum_should_match": 1,
+                    }
+                },
+            }
+
         try:
-            resp = os_client.search(index=OPENSEARCH_INDEX_NAME, body=query_body)
+            resp = self.client.search(index=self.index_name, body=query_body)
             hits = resp["hits"]["hits"]
             results = []
-            for h in hits:
-                doc_score = h["_score"]
-                doc_source = h["_source"]
+            for hit in hits:
+                doc_score = hit["_score"]
+                doc_source = hit["_source"]
                 results.append((doc_source, float(doc_score)))
 
             return results
         except Exception as e:
-            print(f"[OpenSearchIndexer - Hybrid Search] Search error: {e}")
+            print(f"[OpenSearchIndexer - hybrid_search] Error: {e}")
             return []
 
 
