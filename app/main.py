@@ -1088,28 +1088,43 @@ class OpenSearchIndexer:
             return False
 
     def add_embeddings(self, embeddings: np.ndarray, docs: List[Dict[str, str]]):
-        if not self.client or embeddings.size == 0:
-            print("[OpenSearchIndexer] No embeddings or no OpenSearch client.")
+        if not self.client:
+            print(
+                "[OpenSearchIndexer - add_embeddings] No OpenSearch client available."
+            )
+            return
+        if embeddings.size == 0 or not docs:
+            print("[OpenSearchIndexer - add_embeddings] No embeddings or empty docs.")
             return
 
-        actions = []
+        if embeddings.shape[0] != len(docs):
+            print(
+                f"[OpenSearchIndexer - add_embeddings] Mismatch: embeddings={embeddings.shape[0]}, docs={len(docs)}"
+            )
+            return
+
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
         embeddings = embeddings / (norms + 1e-9)
 
+        actions = []
         for i, (doc_dict, emb) in enumerate(zip(docs, embeddings)):
             doc_id = doc_dict.get("doc_id", "")
-            text_content = doc_dict.get("text", "")
+            unstructured_text = doc_dict.get("unstructuredText", "")
+            if not unstructured_text and "text" in doc_dict:
+                unstructured_text = doc_dict["text"]
+
             source_body = {
                 "doc_id": doc_id,
                 "doc_type": "unstructured",
-                "unstructuredText": text_content,
+                "unstructuredText": unstructured_text,
                 "embedding": emb.tolist(),
             }
             action = {
-                "_op_type": "index",
+                "_op_type": "update",
                 "_index": self.index_name,
                 "_id": f"{doc_id}_{i}",
                 "_source": source_body,
+                "doc_as_upsert": True,
             }
 
             actions.append(action)
