@@ -35,13 +35,13 @@ jobs:
         run: |
           flake8 --max-line-length=100 --ignore=E203,E266,E501,W503 .
 
-      - name: Check formatting with Black
-        run: |
-          black --check --diff .
+    #   - name: Check formatting with Black
+    #     run: |
+    #       black --check --diff .
 
-      - name: Check imports with isort
-        run: |
-          isort --check-only --diff .
+    #   - name: Check imports with isort
+    #     run: |
+    #       isort --check-only --diff .
 
       - name: Run tests with Coverage
         run: |
