@@ -14,8 +14,6 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from opensearchpy import OpenSearch, RequestsHttpConnection
 from opensearchpy.helpers import bulk
 
-import psycopg2
-import psycopg2.extras
 import asyncpg
 
 ###############################################################################
