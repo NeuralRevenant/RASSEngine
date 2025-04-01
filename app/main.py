@@ -1969,6 +1969,7 @@ async def lifespan(app: FastAPI):
     rass_engine = RASSEngine()
 
     await rass_engine.ingest_fhir_directory(EMB_DIR)
+    await rass_engine.build_embeddings_from_scratch(EMB_DIR)
     print("[Lifespan] RASSEngine is ready.")
     yield
     print("[Lifespan] Server is shutting down...")
