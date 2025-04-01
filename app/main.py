@@ -64,11 +64,12 @@ REDIS_SHORT_TTL_SECONDS = int(
     os.getenv("REDIS_SHORT_TTL_SECONDS", 600)
 )  # short TTL for newly updated entries
 
-EMB_DIR = os.getenv("EMB_DIR", "notes")
+EMB_DIR = os.getenv("EMB_DIR", "sample_dataset")
 
-OPENSEARCH_HOST = os.environ.get("OPENSEARCH_HOST", "localhost")
-OPENSEARCH_PORT = int(os.environ.get("OPENSEARCH_PORT", 9200))
+OPENSEARCH_HOST = os.getenv("OPENSEARCH_HOST", "localhost")
+OPENSEARCH_PORT = int(os.getenv("OPENSEARCH_PORT", 9200))
 OPENSEARCH_INDEX_NAME = os.getenv("OPENSEARCH_INDEX_NAME", "")
+TOP_K = int(os.getenv("TOP_K", "3"))
 
 POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
 POSTGRES_PORT = os.getenv("POSTGRES_PORT", "5432")
@@ -209,7 +210,9 @@ async def ollama_embed_text(text: str) -> List[float]:
         return data.get("embedding", [])
 
 
-async def embed_texts_in_batches(texts: List[str], batch_size: int = 64) -> np.ndarray:
+async def embed_texts_in_batches(
+    texts: List[str], batch_size: int = BATCH_SIZE
+) -> np.ndarray:
     """
     Embeds a list of texts in smaller batches, respecting concurrency limits.
     """
@@ -487,9 +490,9 @@ except Exception as e:
     os_client = None
 
 
-# ==============================================================================
+# ========================================================
 # Parsing FHIR Bundle
-# ==============================================================================
+# ====================================================
 def parse_fhir_bundle(bundle_json: Dict) -> Tuple[List[Dict], List[Dict]]:
     """
     Returns two lists:
@@ -501,7 +504,7 @@ def parse_fhir_bundle(bundle_json: Dict) -> Tuple[List[Dict], List[Dict]]:
 
     We handle multiple resource types: Patient, Condition, Observation, Encounter,
     MedicationRequest, Procedure, AllergyIntolerance, Practitioner, Organization, etc.
-    We gather text from resource.text.div, resource.note, etc. for the unstructured docs.
+    and gather text from resource.text.div, resource.note, etc. for the unstructured docs.
     """
     structured_docs = []
     unstructured_docs = []
@@ -912,6 +915,7 @@ def parse_fhir_bundle(bundle_json: Dict) -> Tuple[List[Dict], List[Dict]]:
                     ntxt = note.get("text", "").strip()
                     if ntxt:
                         a_notes.append(ntxt)
+
                 if a_notes:
                     sdoc["allergyNote"] = " | ".join(a_notes)
                     unstructured_text_pieces.extend(a_notes)
@@ -1026,7 +1030,7 @@ async def store_fhir_docs_in_opensearch(
             "_op_type": "index",
             "_index": index_name,
             "_id": doc["doc_id"],
-            "_source": doc,
+            "doc": doc,
         }
         bulk_actions_struct.append(action_struct)
 
@@ -1054,7 +1058,7 @@ async def store_fhir_docs_in_opensearch(
             "_op_type": "index",
             "_index": index_name,
             "_id": docu["doc_id"],
-            "_source": docu,
+            "doc": docu,
         }
         bulk_actions_unstruct.append(action_unstruct)
 
@@ -1122,7 +1126,7 @@ class OpenSearchIndexer:
                 "_op_type": "update",
                 "_index": self.index_name,
                 "_id": f"{doc_id}_{i}",
-                "_source": source_body,
+                "doc": source_body,
                 "doc_as_upsert": True,
             }
 
@@ -1142,7 +1146,7 @@ class OpenSearchIndexer:
             print(f"[OpenSearchIndexer] Bulk indexing error: {e}")
 
     def exact_match_search(
-        self, query_text: str, k: int = 3
+        self, query_text: str, k: int = TOP_K
     ) -> List[Tuple[Dict[str, str], float]]:
         if not self.client or not query_text.strip():
             return []
@@ -1222,7 +1226,7 @@ class OpenSearchIndexer:
             return []
 
     def semantic_search(
-        self, query_emb: np.ndarray, k: int = 3, filter_clause: Dict = None
+        self, query_emb: np.ndarray, k: int = TOP_K, filter_clause: Dict = None
     ) -> List[Tuple[Dict[str, str], float]]:
         if not self.client or query_emb.size == 0:
             return []
@@ -1266,7 +1270,7 @@ class OpenSearchIndexer:
         self,
         query_text: str,
         query_emb: np.ndarray,
-        k: int = 3,
+        k: int = TOP_K,
         filter_clause: Dict = None,
     ) -> List[Tuple[Dict[str, str], float]]:
         if not self.client or not query_text.strip() or query_emb.size == 0:
@@ -1451,7 +1455,7 @@ class RASSEngine:
 
     async def build_embeddings_from_scratch(self, pmc_dir: str):
         """
-        Reads text files from the given directory, splits them into chunks,
+        Reads plain-text notes (.txt files) from the given directory, splits them into chunks,
         obtains embeddings, and indexes them in OpenSearch.
         """
         if not self.os_indexer:
@@ -1463,10 +1467,16 @@ class RASSEngine:
             return
 
         print("[RASSEngine] Building embeddings from scratch...")
-        data_files = os.listdir(pmc_dir)
-        all_docs = []
+        all_files = []
+        for root, _, files in os.walk(pmc_dir):
+            all_files.extend(
+                os.path.join(root, f)
+                for f in files
+                if f.endswith(".txt") and f.startswith("PMC")
+            )
 
-        for fname in data_files:
+        all_docs = []
+        for fname in all_files:
             if fname.startswith("PMC") and fname.endswith(".txt"):
                 path = os.path.join(pmc_dir, fname)
                 try:
@@ -1479,16 +1489,16 @@ class RASSEngine:
                 cleaned_text = basic_cleaning(text)
                 text_chunks = chunk_text(cleaned_text, CHUNK_SIZE)
                 for chunk_str in text_chunks:
-                    all_docs.append({"doc_id": fname, "text": chunk_str})
+                    all_docs.append({"doc_id": fname, "unstructuredText": chunk_str})
 
         if not all_docs:
             print("[RASSEngine] No text found in directory. Exiting.")
             return
 
         print(f"[RASSEngine] Generating embeddings for {len(all_docs)} chunks...")
-        chunk_texts = [d["text"] for d in all_docs]
+        chunk_texts = [d["unstructuredText"] for d in all_docs]
 
-        embs = await embed_texts_in_batches(chunk_texts, batch_size=64)
+        embs = await embed_texts_in_batches(chunk_texts, batch_size=BATCH_SIZE)
 
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self.os_indexer.add_embeddings, embs, all_docs)
@@ -1496,20 +1506,29 @@ class RASSEngine:
 
     async def ingest_fhir_directory(self, fhir_dir: str) -> None:
         """
-        Enumerate all FHIR .json files in fhir_dir, parse them, and store in OS.
-        This is production-level logic for hybrid FHIR ingestion.
+        Enumerate all FHIR Json documents in fhir_dir, parse them, and store.
         """
         if not self.os_indexer:
             print("[RASSEngine] No OS indexer => cannot ingest FHIR data.")
             return
 
-        all_files = [f for f in os.listdir(fhir_dir) if f.endswith(".json")]
+        if self.os_indexer.has_any_data():
+            print("[RASSEngine] OpenSearch already has data. Skipping this step.")
+            return
+
+        # all_files = [f for f in os.listdir(fhir_dir) if f.endswith(".json")]
+
+        all_files = []
+        for root, _, files in os.walk(fhir_dir):
+            all_files.extend(
+                os.path.join(root, f) for f in files if f.endswith(".json")
+            )
+
         if not all_files:
             print(f"[RASSEngine] No .json files found in {fhir_dir}.")
             return
 
-        for fname in all_files:
-            path = os.path.join(fhir_dir, fname)
+        for path in all_files:
             print(f"[RASSEngine] Processing FHIR file: {path}")
 
             try:
@@ -1539,7 +1558,7 @@ class RASSEngine:
         query: str,
         user_id: str,
         chat_id: str,
-        top_k: int = 3,
+        top_k: int = TOP_K,
     ) -> str:
         # non empty validation check
         if not query.strip():
@@ -1983,7 +2002,7 @@ async def ask_route(payload: dict = Body(...)):
     query: str = payload.get("query", "")
     user_id = payload.get("user_id", "")
     chat_id = payload.get("chat_id", "")
-    top_k = int(payload.get("top_k", 3))
+    top_k = int(payload.get("top_k", TOP_K))
 
     if not user_id or not chat_id or not query.strip():
         raise HTTPException(status_code=400, detail="Provide user_id, chat_id, query")
@@ -2049,7 +2068,7 @@ async def ask_websocket_endpoint(websocket: WebSocket):
         user_id: str = data.get("user_id", "")
         chat_id: str = data.get("chat_id", "")
         query: str = data.get("query", "")
-        top_k: int = int(data.get("top_k", 3))
+        top_k: int = int(data.get("top_k", TOP_K))
 
         # validate required fields
         if not query.strip() or not user_id or not chat_id:
@@ -2116,24 +2135,310 @@ async def ask_websocket_endpoint(websocket: WebSocket):
 
         # perform retrieval based on intent
         if intent == "SEMANTIC":
-            partial_results = rass_engine.os_indexer.semantic_search(query_emb, k=3)
+            partial_results = rass_engine.os_indexer.semantic_search(query_emb, k=TOP_K)
         elif intent == "KEYWORD":
-            partial_results = rass_engine.os_indexer.exact_match_search(query, k=3)
+            partial_results = rass_engine.os_indexer.exact_match_search(query, k=TOP_K)
         else:  # hyb
             partial_results = rass_engine.os_indexer.hybrid_search(
-                query, query_emb, k=3
+                query, query_emb, k=TOP_K
             )
 
-        # Build contxt
         context_map = {}
         for doc_dict, _score in partial_results:
-            doc_id = doc_dict["doc_id"]
-            text_chunk = doc_dict["text"]
-            if doc_id not in context_map:
-                context_map[doc_id] = text_chunk
-            else:
-                context_map[doc_id] += "\n" + text_chunk
+            doc_id = doc_dict.get("doc_id", "UNKNOWN")
 
+            if doc_dict.get("doc_type", "structured") == "unstructured":
+                # just show the unstructuredText - improvement may be planned later
+                raw_text = doc_dict.get("unstructuredText", "")
+                snippet = f"[Unstructured Text]: {raw_text}"
+            else:
+                # gather all non-empty fields for "structured" docs
+                snippet_pieces = []
+
+                # patient
+                if doc_dict.get("patientId"):
+                    snippet_pieces.append(f"patientId={doc_dict['patientId']}")
+                if doc_dict.get("patientName"):
+                    snippet_pieces.append(f"patientName={doc_dict['patientName']}")
+                if doc_dict.get("patientGender"):
+                    snippet_pieces.append(f"patientGender={doc_dict['patientGender']}")
+                if doc_dict.get("patientDOB"):
+                    snippet_pieces.append(f"patientDOB={doc_dict['patientDOB']}")
+                if doc_dict.get("patientAddress"):
+                    snippet_pieces.append(
+                        f"patientAddress={doc_dict['patientAddress']}"
+                    )
+                if doc_dict.get("patientMaritalStatus"):
+                    snippet_pieces.append(
+                        f"patientMaritalStatus={doc_dict['patientMaritalStatus']}"
+                    )
+                if doc_dict.get("patientMultipleBirth") is not None:
+                    snippet_pieces.append(
+                        f"patientMultipleBirth={doc_dict['patientMultipleBirth']}"
+                    )
+                if doc_dict.get("patientTelecom"):
+                    snippet_pieces.append(
+                        f"patientTelecom={doc_dict['patientTelecom']}"
+                    )
+                if doc_dict.get("patientLanguage"):
+                    snippet_pieces.append(
+                        f"patientLanguage={doc_dict['patientLanguage']}"
+                    )
+
+                # Condition
+                if doc_dict.get("conditionId"):
+                    snippet_pieces.append(f"conditionId={doc_dict['conditionId']}")
+                if doc_dict.get("conditionCodeText"):
+                    snippet_pieces.append(
+                        f"conditionCodeText={doc_dict['conditionCodeText']}"
+                    )
+                if doc_dict.get("conditionCategory"):
+                    snippet_pieces.append(
+                        f"conditionCategory={doc_dict['conditionCategory']}"
+                    )
+                if doc_dict.get("conditionClinicalStatus"):
+                    snippet_pieces.append(
+                        f"conditionClinicalStatus={doc_dict['conditionClinicalStatus']}"
+                    )
+                if doc_dict.get("conditionVerificationStatus"):
+                    snippet_pieces.append(
+                        f"conditionVerificationStatus={doc_dict['conditionVerificationStatus']}"
+                    )
+                if doc_dict.get("conditionOnsetDateTime"):
+                    snippet_pieces.append(
+                        f"conditionOnsetDateTime={doc_dict['conditionOnsetDateTime']}"
+                    )
+                if doc_dict.get("conditionRecordedDate"):
+                    snippet_pieces.append(
+                        f"conditionRecordedDate={doc_dict['conditionRecordedDate']}"
+                    )
+                if doc_dict.get("conditionSeverity"):
+                    snippet_pieces.append(
+                        f"conditionSeverity={doc_dict['conditionSeverity']}"
+                    )
+                if doc_dict.get("conditionNote"):
+                    snippet_pieces.append(f"conditionNote={doc_dict['conditionNote']}")
+
+                # Observation
+                if doc_dict.get("observationId"):
+                    snippet_pieces.append(f"observationId={doc_dict['observationId']}")
+                if doc_dict.get("observationCodeText"):
+                    snippet_pieces.append(
+                        f"observationCodeText={doc_dict['observationCodeText']}"
+                    )
+                if doc_dict.get("observationValue"):
+                    snippet_pieces.append(
+                        f"observationValue={doc_dict['observationValue']}"
+                    )
+                if doc_dict.get("observationUnit"):
+                    snippet_pieces.append(
+                        f"observationUnit={doc_dict['observationUnit']}"
+                    )
+                if doc_dict.get("observationInterpretation"):
+                    snippet_pieces.append(
+                        f"observationInterpretation={doc_dict['observationInterpretation']}"
+                    )
+                if doc_dict.get("observationEffectiveDateTime"):
+                    snippet_pieces.append(
+                        f"observationEffectiveDateTime={doc_dict['observationEffectiveDateTime']}"
+                    )
+                if doc_dict.get("observationIssued"):
+                    snippet_pieces.append(
+                        f"observationIssued={doc_dict['observationIssued']}"
+                    )
+                if doc_dict.get("observationReferenceRange"):
+                    snippet_pieces.append(
+                        f"observationReferenceRange={doc_dict['observationReferenceRange']}"
+                    )
+                if doc_dict.get("observationNote"):
+                    snippet_pieces.append(
+                        f"observationNote={doc_dict['observationNote']}"
+                    )
+
+                # Encounter
+                if doc_dict.get("encounterId"):
+                    snippet_pieces.append(f"encounterId={doc_dict['encounterId']}")
+                if doc_dict.get("encounterStatus"):
+                    snippet_pieces.append(
+                        f"encounterStatus={doc_dict['encounterStatus']}"
+                    )
+                if doc_dict.get("encounterClass"):
+                    snippet_pieces.append(
+                        f"encounterClass={doc_dict['encounterClass']}"
+                    )
+                if doc_dict.get("encounterType"):
+                    snippet_pieces.append(f"encounterType={doc_dict['encounterType']}")
+                if doc_dict.get("encounterReasonCode"):
+                    snippet_pieces.append(
+                        f"encounterReasonCode={doc_dict['encounterReasonCode']}"
+                    )
+                if doc_dict.get("encounterStart"):
+                    snippet_pieces.append(
+                        f"encounterStart={doc_dict['encounterStart']}"
+                    )
+                if doc_dict.get("encounterEnd"):
+                    snippet_pieces.append(f"encounterEnd={doc_dict['encounterEnd']}")
+                if doc_dict.get("encounterLocation"):
+                    snippet_pieces.append(
+                        f"encounterLocation={doc_dict['encounterLocation']}"
+                    )
+                if doc_dict.get("encounterServiceProvider"):
+                    snippet_pieces.append(
+                        f"encounterServiceProvider={doc_dict['encounterServiceProvider']}"
+                    )
+                if doc_dict.get("encounterParticipant"):
+                    snippet_pieces.append(
+                        f"encounterParticipant={doc_dict['encounterParticipant']}"
+                    )
+                if doc_dict.get("encounterNote"):
+                    snippet_pieces.append(f"encounterNote={doc_dict['encounterNote']}")
+
+                # MedicationRequest
+                if doc_dict.get("medRequestId"):
+                    snippet_pieces.append(f"medRequestId={doc_dict['medRequestId']}")
+                if doc_dict.get("medRequestMedicationDisplay"):
+                    snippet_pieces.append(
+                        f"medRequestMedicationDisplay={doc_dict['medRequestMedicationDisplay']}"
+                    )
+                if doc_dict.get("medRequestAuthoredOn"):
+                    snippet_pieces.append(
+                        f"medRequestAuthoredOn={doc_dict['medRequestAuthoredOn']}"
+                    )
+                if doc_dict.get("medRequestIntent"):
+                    snippet_pieces.append(
+                        f"medRequestIntent={doc_dict['medRequestIntent']}"
+                    )
+                if doc_dict.get("medRequestStatus"):
+                    snippet_pieces.append(
+                        f"medRequestStatus={doc_dict['medRequestStatus']}"
+                    )
+                if doc_dict.get("medRequestPriority"):
+                    snippet_pieces.append(
+                        f"medRequestPriority={doc_dict['medRequestPriority']}"
+                    )
+                if doc_dict.get("medRequestDosageInstruction"):
+                    snippet_pieces.append(
+                        f"medRequestDosageInstruction={doc_dict['medRequestDosageInstruction']}"
+                    )
+                if doc_dict.get("medRequestDispenseRequest"):
+                    snippet_pieces.append(
+                        f"medRequestDispenseRequest={doc_dict['medRequestDispenseRequest']}"
+                    )
+                if doc_dict.get("medRequestNote"):
+                    snippet_pieces.append(
+                        f"medRequestNote={doc_dict['medRequestNote']}"
+                    )
+
+                # Procedure
+                if doc_dict.get("procedureId"):
+                    snippet_pieces.append(f"procedureId={doc_dict['procedureId']}")
+                if doc_dict.get("procedureCodeText"):
+                    snippet_pieces.append(
+                        f"procedureCodeText={doc_dict['procedureCodeText']}"
+                    )
+                if doc_dict.get("procedureStatus"):
+                    snippet_pieces.append(
+                        f"procedureStatus={doc_dict['procedureStatus']}"
+                    )
+                if doc_dict.get("procedurePerformedDateTime"):
+                    snippet_pieces.append(
+                        f"procedurePerformedDateTime={doc_dict['procedurePerformedDateTime']}"
+                    )
+                if doc_dict.get("procedureFollowUp"):
+                    snippet_pieces.append(
+                        f"procedureFollowUp={doc_dict['procedureFollowUp']}"
+                    )
+                if doc_dict.get("procedureNote"):
+                    snippet_pieces.append(f"procedureNote={doc_dict['procedureNote']}")
+
+                # AllergyIntolerance
+                if doc_dict.get("allergyId"):
+                    snippet_pieces.append(f"allergyId={doc_dict['allergyId']}")
+                if doc_dict.get("allergyClinicalStatus"):
+                    snippet_pieces.append(
+                        f"allergyClinicalStatus={doc_dict['allergyClinicalStatus']}"
+                    )
+                if doc_dict.get("allergyVerificationStatus"):
+                    snippet_pieces.append(
+                        f"allergyVerificationStatus={doc_dict['allergyVerificationStatus']}"
+                    )
+                if doc_dict.get("allergyType"):
+                    snippet_pieces.append(f"allergyType={doc_dict['allergyType']}")
+                if doc_dict.get("allergyCategory"):
+                    snippet_pieces.append(
+                        f"allergyCategory={doc_dict['allergyCategory']}"
+                    )
+                if doc_dict.get("allergyCriticality"):
+                    snippet_pieces.append(
+                        f"allergyCriticality={doc_dict['allergyCriticality']}"
+                    )
+                if doc_dict.get("allergyCodeText"):
+                    snippet_pieces.append(
+                        f"allergyCodeText={doc_dict['allergyCodeText']}"
+                    )
+                if doc_dict.get("allergyOnsetDateTime"):
+                    snippet_pieces.append(
+                        f"allergyOnsetDateTime={doc_dict['allergyOnsetDateTime']}"
+                    )
+                if doc_dict.get("allergyNote"):
+                    snippet_pieces.append(f"allergyNote={doc_dict['allergyNote']}")
+
+                # Practitioner
+                if doc_dict.get("practitionerId"):
+                    snippet_pieces.append(
+                        f"practitionerId={doc_dict['practitionerId']}"
+                    )
+                if doc_dict.get("practitionerName"):
+                    snippet_pieces.append(
+                        f"practitionerName={doc_dict['practitionerName']}"
+                    )
+                if doc_dict.get("practitionerGender"):
+                    snippet_pieces.append(
+                        f"practitionerGender={doc_dict['practitionerGender']}"
+                    )
+                if doc_dict.get("practitionerSpecialty"):
+                    snippet_pieces.append(
+                        f"practitionerSpecialty={doc_dict['practitionerSpecialty']}"
+                    )
+                if doc_dict.get("practitionerAddress"):
+                    snippet_pieces.append(
+                        f"practitionerAddress={doc_dict['practitionerAddress']}"
+                    )
+                if doc_dict.get("practitionerTelecom"):
+                    snippet_pieces.append(
+                        f"practitionerTelecom={doc_dict['practitionerTelecom']}"
+                    )
+
+                # Organization
+                if doc_dict.get("organizationId"):
+                    snippet_pieces.append(
+                        f"organizationId={doc_dict['organizationId']}"
+                    )
+                if doc_dict.get("organizationName"):
+                    snippet_pieces.append(
+                        f"organizationName={doc_dict['organizationName']}"
+                    )
+                if doc_dict.get("organizationType"):
+                    snippet_pieces.append(
+                        f"organizationType={doc_dict['organizationType']}"
+                    )
+                if doc_dict.get("organizationAddress"):
+                    snippet_pieces.append(
+                        f"organizationAddress={doc_dict['organizationAddress']}"
+                    )
+                if doc_dict.get("organizationTelecom"):
+                    snippet_pieces.append(
+                        f"organizationTelecom={doc_dict['organizationTelecom']}"
+                    )
+
+                snippet = "[Structured Resource] " + " | ".join(snippet_pieces)
+
+            if doc_id not in context_map:
+                context_map[doc_id] = snippet
+            else:
+                context_map[doc_id] += "\n" + snippet
+
+        # Build a short context
         context_text = ""
         for doc_id, doc_content in context_map.items():
             print(doc_id)
@@ -2150,7 +2455,6 @@ async def ask_websocket_endpoint(websocket: WebSocket):
             "6) Do not add chain-of-thought.\n"
             # "7) Answer in at most 4 sentences.\n"
         )
-
         final_prompt = (
             f"Chat History:\n{chat_history_str}\n\n"
             f"User Query:\n{query}\n\n"

@@ -6,6 +6,7 @@ relevant_SS
 rag_env
 RAG.drawio
 RAG.drawio.png
+sample_dataset/
 datasets/
 distilbert_checkpoints/
 distilbert_intent.onnx

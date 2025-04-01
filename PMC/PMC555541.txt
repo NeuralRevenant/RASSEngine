@@ -1,9 +1,0 @@
-
-==== Front
-BMC BioinformaticsBMC Bioinformatics1471-2105BioMed Central London 1471-2105-6-4210.1186/1471-2105-6-42CorrectionCorrection: Determination of the differentially expressed genes in microarray experiments using local FDR Aubert J 1aubert@inapg.frBar-Hen A 1avner@inapg.frDaudin JJ 1daudin@inapg.frRobin S 1robin@inapg.fr1 UM R INAPG/INRA/ENG REF 518, 16, rue C. Bernard, 75231 Paris Cedex 05, France2005 3 3 2005 6 42 42 2 3 2005 3 3 2005 Copyright © 2005 Aubert et al; licensee BioMed Central Ltd.This is an Open Access article distributed under the terms of the Creative Commons Attribution License (), which permits unrestricted use, distribution, and reproduction in any medium, provided the original work is properly cited.
-==== Body
-Following publication of this work [1], the authors became aware that Local FDR has been originally defined by Efron & al. (2001) in a mixture model framework [2].
-==== Refs
-Aubert J Bar-Hen A Daudin JJ Robin S  Determination of the differentially expressed genes in microarray experiments using local FDR BMC Bioinformatics 2004 5 125 15350197 10.1186/1471-2105-5-125 
-Efron B Tibshirani R Storey J Tusher V  Empirical Bayes analysis of a microarray experiment J Am Stat Assoc 2001 96 1151 1160 10.1198/016214501753382129
-

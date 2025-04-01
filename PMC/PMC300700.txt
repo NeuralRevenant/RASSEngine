@@ -1,9 +1,0 @@
-
-==== Front
-PLoS BiolPLoS BiolpbioplosbiolPLoS Biology1544-91731545-7885Public Library of Science San Francisco, USA 10.1371/journal.pbio.0000092CorrectionIn PLoS Biology, volume 1, issue 1: Candidate Gene Association Study in Type 2 Diabetes Indicates a Role for Genes Involved in β-Cell Function as Well as Insulin ActionBarroso Inês Luan Jian'an Middelberg Rita P. S Harding Anne-Helen Franks Paul W Jakes Rupert W Clayton David Schafer Alan J O'Rahilly Stephen Wareham Nicholas J 12 2003 22 12 2003 22 12 2003 1 3 e92Copyright: © 2003 Public Library of Science.2003This is an open-access article distributed under the terms of the Creative Commons Attribution License, which permits unrestricted use, distribution, and reproduction in any medium, provided the original author and source are properly credited.
-Candidate Gene Association Study in Type 2 Diabetes Indicates a Role for Genes Involved in β-Cell Function as Well as Insulin Action
-==== Body
-One of the variants associated with increased diabetes risk was incorrectly indicated throughout this article. The A1369S variant in the gene ABCCB should have been written S1369A. The alanine variant is associated with increased risk. This mistake affects Tables 2 and 4, the text of the article in the section entitled "ABCCB and KCNJ11" on page 45, and the Supporting Information Tables S1 and S2.
-
-The full text XML and HTML versions of the article, and the supporting Tables S1 and S2 have been corrected online.
-
