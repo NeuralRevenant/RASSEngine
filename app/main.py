@@ -59,7 +59,7 @@ REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_MAX_ITEMS = int(os.getenv("REDIS_MAX_ITEMS", 1000))
 REDIS_CACHE_LIST = os.getenv("REDIS_CACHE_LIST", "query_cache_lfu")
-CACHE_SIM_THRESHOLD = int(os.getenv("CACHE_SIM_THRESHOLD", 0.96))
+CACHE_SIM_THRESHOLD = float(os.getenv("CACHE_SIM_THRESHOLD", 0.96))
 REDIS_SHORT_TTL_SECONDS = int(
     os.getenv("REDIS_SHORT_TTL_SECONDS", 600)
 )  # short TTL for newly updated entries
@@ -490,6 +490,16 @@ except Exception as e:
     os_client = None
 
 
+# Helper function
+def extract_code_text(field) -> str:
+    if isinstance(field, dict):
+        return field.get("text") or field.get("coding", [{}])[0].get("code", "")
+    elif isinstance(field, str):
+        return field
+
+    return str(field)
+
+
 # ========================================================
 # Parsing FHIR Bundle
 # ====================================================
@@ -500,7 +510,7 @@ def parse_fhir_bundle(bundle_json: Dict) -> Tuple[List[Dict], List[Dict]]:
       2) unstructured_docs: array of dicts for narrative text (to embed)
     Each resource may produce:
       - One doc capturing structured fields (doc_type='structured')
-      - One or more doc(s) capturing unstructured text (doc_type='unstructured')
+      - One or more docs capturing unstructured text (doc_type='unstructured')
 
     We handle multiple resource types: Patient, Condition, Observation, Encounter,
     MedicationRequest, Procedure, AllergyIntolerance, Practitioner, Organization, etc.
@@ -640,10 +650,13 @@ def parse_fhir_bundle(bundle_json: Dict) -> Tuple[List[Dict], List[Dict]]:
 
             # maritalStatus
             if "maritalStatus" in resource:
-                ms = resource["maritalStatus"]
-                sdoc["patientMaritalStatus"] = ms.get("text") or ms.get("coding", [{}])[
-                    0
-                ].get("code")
+                # ms = resource["maritalStatus"]
+                # sdoc["patientMaritalStatus"] = ms.get("text") or ms.get("coding", [{}])[
+                #     0
+                # ].get("code")
+                sdoc["patientMaritalStatus"] = extract_code_text(
+                    resource["maritalStatus"]
+                )
 
             # multipleBirth
             if "multipleBirthInteger" in resource:
@@ -668,36 +681,46 @@ def parse_fhir_bundle(bundle_json: Dict) -> Tuple[List[Dict], List[Dict]]:
             if "communication" in resource and len(resource["communication"]) > 0:
                 # take first
                 comm = resource["communication"][0]
-                c_lang = comm.get("language", {})
-                sdoc["patientLanguage"] = c_lang.get("text") or c_lang.get(
-                    "coding", [{}]
-                )[0].get("code")
+                # c_lang = comm.get("language", {})
+                # sdoc["patientLanguage"] = c_lang.get("text") or c_lang.get(
+                #     "coding", [{}]
+                # )[0].get("code")
+                sdoc["patientLanguage"] = extract_code_text(comm.get("language", {}))
 
         elif rtype == "Condition":
             sdoc["conditionId"] = rid
-            cstatus = resource.get("clinicalStatus", {})
-            sdoc["conditionClinicalStatus"] = cstatus.get("text") or cstatus.get(
-                "coding", [{}]
-            )[0].get("code")
+            # cstatus = resource.get("clinicalStatus", {})
+            # sdoc["conditionClinicalStatus"] = cstatus.get("text") or cstatus.get(
+            #     "coding", [{}]
+            # )[0].get("code")
 
-            vstatus = resource.get("verificationStatus", {})
-            sdoc["conditionVerificationStatus"] = vstatus.get("text") or vstatus.get(
-                "coding", [{}]
-            )[0].get("code")
+            sdoc["conditionClinicalStatus"] = extract_code_text(
+                resource.get("clinicalStatus", {})
+            )
+
+            # vstatus = resource.get("verificationStatus", {})
+            # sdoc["conditionVerificationStatus"] = vstatus.get("text") or vstatus.get(
+            #     "coding", [{}]
+            # )[0].get("code")
+            sdoc["conditionVerificationStatus"] = extract_code_text(
+                resource.get("verificationStatus", {})
+            )
 
             # category
             if "category" in resource and len(resource["category"]) > 0:
                 cat = resource["category"][0]
-                sdoc["conditionCategory"] = cat.get("text") or cat.get("coding", [{}])[
-                    0
-                ].get("code")
+                # sdoc["conditionCategory"] = cat.get("text") or cat.get("coding", [{}])[
+                #     0
+                # ].get("code")
+                sdoc["conditionCategory"] = extract_code_text(cat)
 
             # severity
             if "severity" in resource:
                 sev = resource["severity"]
-                sdoc["conditionSeverity"] = sev.get("text") or sev.get("coding", [{}])[
-                    0
-                ].get("code")
+                # sdoc["conditionSeverity"] = sev.get("text") or sev.get("coding", [{}])[
+                #     0
+                # ].get("code")
+                sdoc["conditionSeverity"] = extract_code_text(sev)
 
             code_field = resource.get("code", {})
             ctext = code_field.get("text")
@@ -886,15 +909,25 @@ def parse_fhir_bundle(bundle_json: Dict) -> Tuple[List[Dict], List[Dict]]:
 
         elif rtype == "AllergyIntolerance":
             sdoc["allergyId"] = rid
-            sdoc["allergyClinicalStatus"] = resource.get("clinicalStatus", {}).get(
-                "text"
+            # sdoc["allergyClinicalStatus"] = resource.get("clinicalStatus", {}).get(
+            #     "text"
+            # )
+            sdoc["allergyClinicalStatus"] = extract_code_text(
+                resource.get("clinicalStatus")
             )
-            sdoc["allergyVerificationStatus"] = resource.get(
-                "verificationStatus", {}
-            ).get("text")
+            # sdoc["allergyVerificationStatus"] = resource.get(
+            #     "verificationStatus", {}
+            # ).get("text")
+            sdoc["allergyVerificationStatus"] = extract_code_text(
+                resource.get("verificationStatus")
+            )
+
             sdoc["allergyType"] = resource.get("type")
             if "category" in resource and len(resource["category"]) > 0:
-                sdoc["allergyCategory"] = resource["category"][0]
+                # sdoc["allergyCategory"] = resource["category"][0]
+                catval = resource["category"][0]
+                sdoc["allergyCategory"] = extract_code_text(catval)
+
             sdoc["allergyCriticality"] = resource.get("criticality")
 
             code_field = resource.get("code", {})
@@ -932,7 +965,8 @@ def parse_fhir_bundle(bundle_json: Dict) -> Tuple[List[Dict], List[Dict]]:
             if "qualification" in resource and len(resource["qualification"]) > 0:
                 # interpret "qualification" as specialty
                 q = resource["qualification"][0]
-                sdoc["practitionerSpecialty"] = q.get("code", {}).get("text")
+                # sdoc["practitionerSpecialty"] = q.get("code", {}).get("text")
+                sdoc["practitionerSpecialty"] = extract_code_text(q.get("code", {}))
 
             if "address" in resource and len(resource["address"]) > 0:
                 adr = resource["address"][0]
@@ -1462,10 +1496,6 @@ class RASSEngine:
             print("[RASSEngine] No OpenSearchIndexer => cannot build embeddings.")
             return
 
-        if self.os_indexer.has_any_data():
-            print("[RASSEngine] OpenSearch already has data. Skipping embedding.")
-            return
-
         print("[RASSEngine] Building embeddings from scratch...")
         all_files = []
         for root, _, files in os.walk(pmc_dir):
@@ -1476,9 +1506,9 @@ class RASSEngine:
             )
 
         all_docs = []
-        for fname in all_files:
-            if fname.startswith("PMC") and fname.endswith(".txt"):
-                path = os.path.join(pmc_dir, fname)
+        for path in all_files:
+            base_name = os.path.basename(path)
+            if base_name.startswith("PMC") and base_name.endswith(".txt"):
                 try:
                     with open(path, "r", encoding="utf-8") as f:
                         text = f.read()
@@ -1489,7 +1519,9 @@ class RASSEngine:
                 cleaned_text = basic_cleaning(text)
                 text_chunks = chunk_text(cleaned_text, CHUNK_SIZE)
                 for chunk_str in text_chunks:
-                    all_docs.append({"doc_id": fname, "unstructuredText": chunk_str})
+                    all_docs.append(
+                        {"doc_id": base_name, "unstructuredText": chunk_str}
+                    )
 
         if not all_docs:
             print("[RASSEngine] No text found in directory. Exiting.")
@@ -1511,12 +1543,6 @@ class RASSEngine:
         if not self.os_indexer:
             print("[RASSEngine] No OS indexer => cannot ingest FHIR data.")
             return
-
-        if self.os_indexer.has_any_data():
-            print("[RASSEngine] OpenSearch already has data. Skipping this step.")
-            return
-
-        # all_files = [f for f in os.listdir(fhir_dir) if f.endswith(".json")]
 
         all_files = []
         for root, _, files in os.walk(fhir_dir):
@@ -1968,8 +1994,13 @@ async def lifespan(app: FastAPI):
     global rass_engine
     rass_engine = RASSEngine()
 
-    await rass_engine.ingest_fhir_directory(EMB_DIR)
-    await rass_engine.build_embeddings_from_scratch(EMB_DIR)
+    # Check if OpenSearch has any data
+    if rass_engine.os_indexer.has_any_data():
+        print("[RASSEngine] OpenSearch already has data. Skipping embedding.")
+    else:
+        await rass_engine.ingest_fhir_directory(EMB_DIR)
+        await rass_engine.build_embeddings_from_scratch(EMB_DIR)
+
     print("[Lifespan] RASSEngine is ready.")
     yield
     print("[Lifespan] Server is shutting down...")
