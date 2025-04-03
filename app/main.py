@@ -1185,64 +1185,154 @@ class OpenSearchIndexer:
         if not self.client or not query_text.strip():
             return []
 
-        fields_for_multi_match = [
-            "unstructuredText^3",
-            "patientName",
-            "patientGender",
-            "patientDOB",
-            "patientAddress",
-            "patientMaritalStatus",
-            "patientTelecom",
-            "patientLanguage",
-            "conditionCodeText",
-            "conditionCategory",
-            "conditionClinicalStatus",
-            "conditionVerificationStatus",
-            "conditionOnsetDateTime",
-            "conditionRecordedDate",
-            "conditionSeverity",
-            "conditionNote",
+        # fields_for_multi_match = [
+        #     "unstructuredText^3",
+        #     "patientName",
+        #     "patientGender",
+        #     "patientDOB",
+        #     "patientAddress",
+        #     "patientMaritalStatus",
+        #     "patientTelecom",
+        #     "patientLanguage",
+        #     "conditionCodeText",
+        #     "conditionCategory",
+        #     "conditionClinicalStatus",
+        #     "conditionVerificationStatus",
+        #     "conditionOnsetDateTime",
+        #     "conditionRecordedDate",
+        #     "conditionSeverity",
+        #     "conditionNote",
+        #     "observationCodeText",
+        #     "observationValue",
+        #     "observationUnit",
+        #     "observationInterpretation",
+        #     "observationEffectiveDateTime",
+        #     "observationIssued",
+        #     "observationReferenceRange",
+        #     "observationNote",
+        #     "encounterType",
+        #     "encounterReasonCode",
+        #     "encounterLocation",
+        #     "encounterServiceProvider",
+        #     "encounterParticipant",
+        #     "encounterNote",
+        #     "medRequestMedicationDisplay",
+        #     "medRequestNote",
+        #     "procedureCodeText",
+        #     "procedureNote",
+        #     "allergyCodeText",
+        #     "allergyNote",
+        #     "practitionerName",
+        #     "practitionerGender",
+        #     "practitionerSpecialty",
+        #     "practitionerAddress",
+        #     "practitionerTelecom",
+        #     "organizationName",
+        #     "organizationType",
+        #     "organizationAddress",
+        #     "organizationTelecom",
+        # ]
+
+        text_fields = [
+            "unstructuredText^3",  # Boost unstructured text, other fields similarly ...
+            "patientName^3",
+            "patientAddress^3",
+            "patientTelecom^3",
+            "conditionCodeText^2",  # Boost condition text, other fields similarly ...
+            "conditionNote^2",
             "observationCodeText",
             "observationValue",
-            "observationUnit",
-            "observationInterpretation",
-            "observationEffectiveDateTime",
-            "observationIssued",
             "observationReferenceRange",
-            "observationNote",
+            "observationNote^2",
             "encounterType",
             "encounterReasonCode",
             "encounterLocation",
-            "encounterServiceProvider",
-            "encounterParticipant",
             "encounterNote",
             "medRequestMedicationDisplay",
             "medRequestNote",
             "procedureCodeText",
             "procedureNote",
             "allergyCodeText",
-            "allergyNote",
-            "practitionerName",
-            "practitionerGender",
-            "practitionerSpecialty",
+            "allergyNote^2",
+            "practitionerName^3",
             "practitionerAddress",
             "practitionerTelecom",
-            "organizationName",
-            "organizationType",
+            "organizationName^3",
             "organizationAddress",
             "organizationTelecom",
         ]
 
+        keyword_fields = [
+            "patientGender^3",
+            "patientMaritalStatus^2",
+            "patientLanguage^3",
+            "conditionCategory^2",
+            "conditionClinicalStatus",
+            "conditionVerificationStatus",
+            "conditionSeverity",
+            "observationUnit",
+            "observationInterpretation",
+            "encounterStatus",
+            "encounterClass",
+            "encounterServiceProvider",
+            "medRequestIntent",
+            "medRequestStatus",
+            "medRequestPriority",
+            "procedureStatus",
+            "allergyClinicalStatus",
+            "allergyVerificationStatus",
+            "allergyType",
+            "allergyCategory",
+            "allergyCriticality",
+            "practitionerGender",
+            "practitionerSpecialty",
+            "organizationType",
+        ]
+
+        # text-based subquery (only text fields)
+        text_subquery = {
+            "multi_match": {
+                "query": query_text,
+                "fields": text_fields,
+                "type": "best_fields",
+                "operator": "or",  # relaxed to find broader matches
+                "fuzziness": "AUTO",
+            }
+        }
+
+        # keyword subquery (exact matches on keyword fields)
+        keyword_subquery = {
+            "multi_match": {
+                "query": query_text,
+                "fields": keyword_fields,
+                "type": "best_fields",
+                "operator": "or",
+            }
+        }
+
+        # patient-specific filter for queries mentioning 'patients'
+        patient_filter = (
+            {"exists": {"field": "patientId"}}
+            if "patient" in query_text.lower()
+            else None
+        )
+
+        # build the query
+        bool_query = {
+            "should": [
+                text_subquery,
+                keyword_subquery,
+            ],
+            "minimum_should_match": 1,  # At least one condition must match
+        }
+
+        if patient_filter:
+            bool_query["filter"] = [patient_filter]
+
         query_body = {
             "size": k,
             "query": {
-                "multi_match": {
-                    "query": query_text,
-                    "fields": fields_for_multi_match,
-                    "type": "best_fields",
-                    "operator": "and",
-                    "fuzziness": "AUTO",
-                }
+                "bool": bool_query,
             },
         }
 
@@ -1314,87 +1404,109 @@ class OpenSearchIndexer:
         query_emb = query_emb / (norms + 1e-9)
         vector = query_emb[0].tolist()
 
-        fields_for_multi_match = [
-            "unstructuredText^3",
-            "patientName",
-            "patientGender",
-            "patientDOB",
-            "patientAddress",
-            "patientMaritalStatus",
-            "patientTelecom",
-            "patientLanguage",
-            "conditionCodeText",
-            "conditionCategory",
-            "conditionClinicalStatus",
-            "conditionVerificationStatus",
-            "conditionOnsetDateTime",
-            "conditionRecordedDate",
-            "conditionSeverity",
-            "conditionNote",
+        text_fields = [
+            "unstructuredText^3",  # Boost unstructured text, ....
+            "patientName^3",
+            "patientAddress^3",
+            "patientTelecom^3",
+            "conditionCodeText^2",  # Boost condition text, ...
+            "conditionNote^2",
             "observationCodeText",
             "observationValue",
-            "observationUnit",
-            "observationInterpretation",
-            "observationEffectiveDateTime",
-            "observationIssued",
             "observationReferenceRange",
-            "observationNote",
+            "observationNote^2",
             "encounterType",
             "encounterReasonCode",
             "encounterLocation",
-            "encounterServiceProvider",
-            "encounterParticipant",
             "encounterNote",
             "medRequestMedicationDisplay",
             "medRequestNote",
             "procedureCodeText",
             "procedureNote",
             "allergyCodeText",
-            "allergyNote",
-            "practitionerName",
-            "practitionerGender",
-            "practitionerSpecialty",
+            "allergyNote^2",
+            "practitionerName^3",
             "practitionerAddress",
             "practitionerTelecom",
-            "organizationName",
-            "organizationType",
+            "organizationName^3",
             "organizationAddress",
             "organizationTelecom",
         ]
 
+        keyword_fields = [
+            "patientGender^3",
+            "patientMaritalStatus^2",
+            "patientLanguage^3",
+            "conditionCategory^2",
+            "conditionClinicalStatus",
+            "conditionVerificationStatus",
+            "conditionSeverity",
+            "observationUnit",
+            "observationInterpretation",
+            "encounterStatus",
+            "encounterClass",
+            "encounterServiceProvider",
+            "medRequestIntent",
+            "medRequestStatus",
+            "medRequestPriority",
+            "procedureStatus",
+            "allergyClinicalStatus",
+            "allergyVerificationStatus",
+            "allergyType",
+            "allergyCategory",
+            "allergyCriticality",
+            "practitionerGender",
+            "practitionerSpecialty",
+            "organizationType",
+        ]
+
+        knn_subquery = {"knn": {"embedding": {"vector": vector, "k": k}}}
+
         text_subquery = {
             "multi_match": {
                 "query": query_text,
-                "fields": fields_for_multi_match,
+                "fields": text_fields,
                 "type": "best_fields",
-                "operator": "and",
+                "operator": "or",
                 "fuzziness": "AUTO",
             }
         }
 
-        knn_subquery = {"knn": {"embedding": {"vector": vector, "k": k}}}
+        keyword_subquery = {
+            "multi_match": {
+                "query": query_text,
+                "fields": keyword_fields,
+                "type": "best_fields",
+                "operator": "or",
+            }
+        }
 
-        if filter_clause:
-            query_body = {
-                "size": k,
-                "query": {
-                    "bool": {
-                        "must": [filter_clause],
-                        "should": [text_subquery, knn_subquery],
-                        "minimum_should_match": 1,
-                    }
-                },
-            }
-        else:
-            query_body = {
-                "size": k,
-                "query": {
-                    "bool": {
-                        "should": [text_subquery, knn_subquery],
-                        "minimum_should_match": 1,
-                    }
-                },
-            }
+        patient_filter = (
+            {"exists": {"field": "patientId"}}
+            if "patient" in query_text.lower()
+            else None
+        )
+
+        bool_query = {
+            "should": [
+                text_subquery,
+                keyword_subquery,
+                knn_subquery,
+            ],
+            "minimum_should_match": 1,
+        }
+
+        if filter_clause or patient_filter:
+            bool_query["filter"] = []
+            if filter_clause:
+                bool_query["filter"].append(filter_clause)
+            if patient_filter:
+                bool_query["filter"].append(patient_filter)
+
+        query_body = {
+            "size": k,
+            "query": {"bool": bool_query},
+        }
 
         try:
             resp = self.client.search(index=self.index_name, body=query_body)
@@ -1489,7 +1601,7 @@ class RASSEngine:
 
     async def build_embeddings_from_scratch(self, pmc_dir: str):
         """
-        Reads plain-text notes (.txt files) from the given directory, splits them into chunks,
+        Reads plain-text notes (.txt and .md files) from the given directory, splits them into chunks,
         obtains embeddings, and indexes them in OpenSearch.
         """
         if not self.os_indexer:
@@ -2029,7 +2141,7 @@ async def ask_route(payload: dict = Body(...)):
       2) fetch last 10 messages for context
       3) embed query => check redis => if new
       4) retrieve from OpenSearch => build context
-      5) call BlueHive => store new user query + new response in DB
+      5) call LLM => store new user query + new response in DB
     """
     query: str = payload.get("query", "")
     user_id = payload.get("user_id", "")
