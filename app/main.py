@@ -490,7 +490,9 @@ except Exception as e:
     os_client = None
 
 
-# Helper function
+# ========================================================
+# Parsing FHIR Bundle
+# ====================================================
 def extract_code_text(field) -> str:
     if isinstance(field, dict):
         return field.get("text") or field.get("coding", [{}])[0].get("code", "")
@@ -500,9 +502,6 @@ def extract_code_text(field) -> str:
     return str(field)
 
 
-# ========================================================
-# Parsing FHIR Bundle
-# ====================================================
 def parse_fhir_bundle(bundle_json: Dict) -> Tuple[List[Dict], List[Dict]]:
     """
     Returns two lists:
@@ -1013,27 +1012,26 @@ def parse_fhir_bundle(bundle_json: Dict) -> Tuple[List[Dict], List[Dict]]:
                 if otele_arr:
                     sdoc["organizationTelecom"] = " | ".join(otele_arr)
 
-        # more resource types can be added here later for future uses
+        # ... if needed in the future more resource types can be added ...
 
         # add the structured doc
         structured_docs.append(sdoc)
 
-        # If we have unstructured text, chunk it out for embedding
-        # Because these are notes, we set doc_type="unstructured"
-        # Each chunk becomes a separate doc due to chunking
+        # chunk unstructured text for embedding as these are notes, we set
+        # doc_type="unstructured". Each chunk becomes a separate doc due to chunking
         if unstructured_text_pieces:
             combined_text = "\n".join(unstructured_text_pieces).strip()
             if not combined_text:
                 continue
 
-            # Possibly chunk if large
+            # chunk long text
             text_chunks = chunk_text(combined_text, chunk_size=CHUNK_SIZE)
             for c_i, chunk_str in enumerate(text_chunks):
                 udoc = {
                     "doc_id": f"{rtype}-{rid}-unstructured-{c_i}",
                     "doc_type": "unstructured",
                     "resourceType": rtype,
-                    # We'll store the text in "unstructuredText" field
+                    # storing the text in 'unstructuredText' field
                     "unstructuredText": chunk_str,
                 }
                 unstructured_docs.append(udoc)
@@ -1064,7 +1062,7 @@ async def store_fhir_docs_in_opensearch(
             "_op_type": "index",
             "_index": index_name,
             "_id": doc["doc_id"],
-            "doc": doc,
+            "_source": doc,
         }
         bulk_actions_struct.append(action_struct)
 
@@ -1087,12 +1085,12 @@ async def store_fhir_docs_in_opensearch(
     for i, docu in enumerate(unstructured_docs):
         emb_vec = embeddings_normed[i]
         docu["embedding"] = emb_vec.tolist()  # store as float array
-        # We'll store docu in index, using "doc_id" as _id
+        # storing docu in index using the doc_id as _id
         action_unstruct = {
             "_op_type": "index",
             "_index": index_name,
             "_id": docu["doc_id"],
-            "doc": docu,
+            "_source": docu,
         }
         bulk_actions_unstruct.append(action_unstruct)
 
@@ -1157,11 +1155,10 @@ class OpenSearchIndexer:
                 "embedding": emb.tolist(),
             }
             action = {
-                "_op_type": "update",
+                "_op_type": "index",
                 "_index": self.index_name,
                 "_id": f"{doc_id}_{i}",
-                "doc": source_body,
-                "doc_as_upsert": True,
+                "_source": source_body,
             }
 
             actions.append(action)
