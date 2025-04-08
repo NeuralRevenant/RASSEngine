@@ -21,7 +21,7 @@ from bs4 import BeautifulSoup
 
 ##########################################
 # Load environment variables
-#############################
+#################################
 load_dotenv()
 
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "")
@@ -45,26 +45,28 @@ POSTGRES_USER = os.getenv("POSTGRES_USER", "")
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
 POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
 
-######################################
-# FastAPI app
-########################################
-app = FastAPI(
-    title="Embedding Microservice",
-    version="1.0.0",
-)
-
-
 db = Prisma()
 
 
-@app.on_event("startup")
-async def on_startup():
+######################################
+# FastAPI app
+########################################
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("[Lifespan] Starting Embedding Service...")
+    # Handles database connection lifecycle
     await db.connect()
-
-
-@app.on_event("shutdown")
-async def on_shutdown():
+    print("[Lifespan] Embedding Service is ready.")
+    yield
+    print("[Lifespan] Server is shutting down...")
     await db.disconnect()
+
+
+app = FastAPI(
+    title="Embedding Service to handle file uploads",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 
 ############################################
@@ -962,4 +964,4 @@ async def upload_data(user_id: str = Form(...), files: List[UploadFile] = File(.
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=9001, reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=False)
