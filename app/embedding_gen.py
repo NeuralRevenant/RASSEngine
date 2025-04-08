@@ -9,6 +9,7 @@ import json
 from typing import List, Dict, Tuple, Optional
 
 import httpx
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from opensearchpy import OpenSearch, RequestsHttpConnection
 from opensearchpy.helpers import bulk
@@ -58,7 +59,7 @@ async def lifespan(app: FastAPI):
     await db.connect()
     print("[Lifespan] Embedding Service is ready.")
     yield
-    print("[Lifespan] Server is shutting down...")
+    print("[Lifespan] Embedding Service is shutting down...")
     await db.disconnect()
 
 
