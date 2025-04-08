@@ -2276,12 +2276,12 @@ async def ask_websocket_endpoint(websocket: WebSocket):
 
         # perform retrieval based on intent
         if intent == "SEMANTIC":
-            partial_results = rass_engine.os_indexer.semantic_search(query_emb, k=TOP_K)
+            partial_results = rass_engine.os_indexer.semantic_search(query_emb, k=top_k)
         elif intent == "KEYWORD":
-            partial_results = rass_engine.os_indexer.exact_match_search(query, k=TOP_K)
+            partial_results = rass_engine.os_indexer.exact_match_search(query, k=top_k)
         else:  # hyb
             partial_results = rass_engine.os_indexer.hybrid_search(
-                query, query_emb, k=TOP_K
+                query, query_emb, k=top_k
             )
 
         context_map = {}
