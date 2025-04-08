@@ -17,6 +17,9 @@ langchain  # core LangChain lib
 langchain-community  # community extensions for LangChain
 langchain-openai  # openAI-specific LangChain integration
 spacy
+# markdown support
+markdown
+beautifulsoup4
 # testing
 pytest
 pytest-asyncio

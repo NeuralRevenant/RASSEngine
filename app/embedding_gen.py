@@ -15,6 +15,10 @@ from opensearchpy.helpers import bulk
 from dotenv import load_dotenv
 from prisma import Prisma
 
+import markdown
+from bs4 import BeautifulSoup
+
+
 ##########################################
 # Load environment variables
 #############################
@@ -63,9 +67,32 @@ async def on_shutdown():
     await db.disconnect()
 
 
+############################################
+# Markdown file processing
+########################################
+def parse_markdown_file(path: str) -> str:
+    """
+    Reads a Markdown (.md) file from the given path, converts it to HTML using the
+    python-markdown library, and then uses BeautifulSoup to extract plain text.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            md_content = f.read()
+    except UnicodeDecodeError:
+        with open(path, "r", encoding="latin-1") as f:
+            md_content = f.read()
+
+    # Convert the Markdown content to HTML
+    html = markdown.markdown(md_content)
+    # Use BeautifulSoup to parse the HTML and extract plain text
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(separator=" ")
+    return text
+
+
 ##############################################
 # OpenSearch
-######################################
+########################################
 try:
     os_client = OpenSearch(
         hosts=[{"host": OPENSEARCH_HOST, "port": OPENSEARCH_PORT}],
@@ -81,9 +108,9 @@ except Exception as e:
     os_client = None
 
 
-###############################################################################
+#############################################################
 # Create user-specific index
-###############################################################################
+############################################################
 def init_user_index(user_id: str):
     if not os_client:
         print("[WARNING] No OpenSearch client => cannot init user index.")
@@ -307,6 +334,7 @@ def bulk_index_unstructured(
     if not os_client:
         print("[ERROR] No OpenSearch => cannot index unstructured docs.")
         return
+
     index_name = f"{OPENSEARCH_INDEX_NAME}-{user_id}"
     init_user_index(user_id)
 
@@ -361,6 +389,7 @@ def bulk_index_structured(user_id: str, doc_id: str, structured_docs: List[Dict]
     if not os_client:
         print("[ERROR] No OpenSearch => cannot index structured docs.")
         return
+
     index_name = f"{OPENSEARCH_INDEX_NAME}-{user_id}"
     init_user_index(user_id)
 
@@ -368,6 +397,7 @@ def bulk_index_structured(user_id: str, doc_id: str, structured_docs: List[Dict]
     for i, sdoc in enumerate(structured_docs):
         if "doc_type" not in sdoc:
             sdoc["doc_type"] = "structured"
+
         final_id = sdoc.get("doc_id", f"{doc_id}_structured_{i}")
         action = {
             "_op_type": "index",
@@ -850,18 +880,50 @@ async def upload_data(user_id: str = Form(...), files: List[UploadFile] = File(.
             except UnicodeDecodeError:
                 with open(final_path, "r", encoding="latin-1") as ff:
                     text_str = ff.read()
+
             if not text_str.strip():
                 raise HTTPException(
                     status_code=400, detail=f"File {upl_file.filename} is empty."
                 )
+
             txt_chunks = chunk_text(text_str, CHUNK_SIZE)
             txt_embs = await embed_texts_in_batches(txt_chunks)
             if txt_embs.shape[0] != len(txt_chunks):
                 raise HTTPException(
                     status_code=500, detail="Mismatch chunk vs embedding count."
                 )
+
             bulk_index_unstructured(
                 user_id, doc_id, txt_chunks, txt_embs, resourceType=None
+            )
+
+        elif (
+            extension == ".md"
+        ):  # for Markdown files, convert to plain text using our helper function
+            md_text = ""
+            try:
+                md_text = parse_markdown_file(final_path)
+            except Exception as ex:
+                raise HTTPException(
+                    status_code=500, detail=f"Markdown parse error: {ex}"
+                )
+
+            if not md_text.strip():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"File {upl_file.filename} is empty after parsing.",
+                )
+
+            md_chunks = chunk_text(md_text, CHUNK_SIZE)
+            md_embs = await embed_texts_in_batches(md_chunks)
+            if md_embs.shape[0] != len(md_chunks):
+                raise HTTPException(
+                    status_code=500,
+                    detail="Mismatch chunk vs embedding count for Markdown file.",
+                )
+
+            bulk_index_unstructured(
+                user_id, doc_id, md_chunks, md_embs, resourceType=None
             )
 
         elif extension == ".json":
@@ -885,6 +947,7 @@ async def upload_data(user_id: str = Form(...), files: List[UploadFile] = File(.
                             status_code=500,
                             detail="Mismatch chunk vs embedding count for unstructured text in FHIR.",
                         )
+
                     sub_doc_id = f"{doc_id}_{resType}"
                     bulk_index_unstructured(
                         user_id, sub_doc_id, un_chunks, un_embs, resourceType=resType
