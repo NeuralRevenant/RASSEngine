@@ -2112,7 +2112,7 @@ async def lifespan(app: FastAPI):
 
     print("[Lifespan] RASSEngine is ready.")
     yield
-    print("[Lifespan] Server is shutting down...")
+    print("[Lifespan] RASSEngine is shutting down...")
     await db.disconnect()
     await close_redis()
 
