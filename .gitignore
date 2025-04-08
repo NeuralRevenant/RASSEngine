@@ -15,3 +15,4 @@ distilbert_intent_final/
 model_nlu/
 training_checkpoint.json
 old_trained_pipelines/
+uploads/
