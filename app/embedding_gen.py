@@ -357,13 +357,14 @@ def bulk_index_unstructured(
         if resourceType:
             body_doc["resourceType"] = resourceType
 
-        action = {
-            "_op_type": "index",
-            "_index": index_name,
-            "_id": chunk_id,
-            "_source": body_doc,
-        }
-        actions.append(action)
+        actions.append(
+            {
+                "_op_type": "index",
+                "_index": index_name,
+                "_id": chunk_id,
+                "_source": body_doc,
+            }
+        )
 
         if len(actions) >= BATCH_SIZE:
             try:
@@ -374,6 +375,7 @@ def bulk_index_unstructured(
                     )
             except Exception as e:
                 print("[OpenSearch] bulk error unstructured:", e)
+
             actions = []
 
     if actions:
@@ -402,13 +404,14 @@ def bulk_index_structured(user_id: str, doc_id: str, structured_docs: List[Dict]
             sdoc["doc_type"] = "structured"
 
         final_id = sdoc.get("doc_id", f"{doc_id}_structured_{i}")
-        action = {
-            "_op_type": "index",
-            "_index": index_name,
-            "_id": final_id,
-            "_source": sdoc,
-        }
-        actions.append(action)
+        actions.append(
+            {
+                "_op_type": "index",
+                "_index": index_name,
+                "_id": final_id,
+                "_source": sdoc,
+            }
+        )
 
         if len(actions) >= BATCH_SIZE:
             try:
@@ -431,21 +434,45 @@ def bulk_index_structured(user_id: str, doc_id: str, structured_docs: List[Dict]
 ################################################
 # FHIR Parser
 ################################################
-def parse_fhir_bundle(bundle_json: Dict) -> Tuple[List[Dict], List[Tuple[str, str]]]:
+def extract_code_text(field) -> str:
+    if isinstance(field, dict):
+        return field.get("text") or field.get("coding", [{}])[0].get("code", "")
+    elif isinstance(field, str):
+        return field
+
+    return str(field)
+
+
+def parse_fhir_bundle(bundle_json: Dict) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Returns two lists:
+      1) structured_docs: array of dicts with typed FHIR fields
+      2) unstructured_docs: array of dicts for narrative text (to embed)
+    Each resource may produce:
+      - One doc capturing structured fields (doc_type='structured')
+      - One or more docs capturing unstructured text (doc_type='unstructured')
+
+    We handle multiple resource types: Patient, Condition, Observation, Encounter,
+    MedicationRequest, Procedure, AllergyIntolerance, Practitioner, Organization, etc.
+    and gather text from resource.text.div, resource.note, etc. for the unstructured docs.
+    """
     structured_docs = []
-    unstructured_data = []
+    unstructured_docs = []
 
     if not bundle_json or "entry" not in bundle_json:
-        return structured_docs, unstructured_data
+        return (structured_docs, unstructured_docs)
 
     for entry in bundle_json["entry"]:
         resource = entry.get("resource", {})
         rtype = resource.get("resourceType", "")
         rid = resource.get("id", "")
+
+        # create a 'structured doc' capturing typed fields:
         sdoc = {
             "doc_id": f"{rtype}-{rid}-structured",
             "doc_type": "structured",
             "resourceType": rtype,
+            # Patient
             "patientId": None,
             "patientName": None,
             "patientGender": None,
@@ -455,6 +482,7 @@ def parse_fhir_bundle(bundle_json: Dict) -> Tuple[List[Dict], List[Tuple[str, st
             "patientMultipleBirth": None,
             "patientTelecom": None,
             "patientLanguage": None,
+            # Condition
             "conditionId": None,
             "conditionCodeText": None,
             "conditionCategory": None,
@@ -464,6 +492,7 @@ def parse_fhir_bundle(bundle_json: Dict) -> Tuple[List[Dict], List[Tuple[str, st
             "conditionRecordedDate": None,
             "conditionSeverity": None,
             "conditionNote": None,
+            # Observation
             "observationId": None,
             "observationCodeText": None,
             "observationValue": None,
@@ -473,6 +502,7 @@ def parse_fhir_bundle(bundle_json: Dict) -> Tuple[List[Dict], List[Tuple[str, st
             "observationIssued": None,
             "observationReferenceRange": None,
             "observationNote": None,
+            # Encounter
             "encounterId": None,
             "encounterStatus": None,
             "encounterClass": None,
@@ -484,6 +514,7 @@ def parse_fhir_bundle(bundle_json: Dict) -> Tuple[List[Dict], List[Tuple[str, st
             "encounterServiceProvider": None,
             "encounterParticipant": None,
             "encounterNote": None,
+            # MedicationRequest
             "medRequestId": None,
             "medRequestMedicationDisplay": None,
             "medRequestAuthoredOn": None,
@@ -493,12 +524,14 @@ def parse_fhir_bundle(bundle_json: Dict) -> Tuple[List[Dict], List[Tuple[str, st
             "medRequestDosageInstruction": None,
             "medRequestDispenseRequest": None,
             "medRequestNote": None,
+            # Procedure
             "procedureId": None,
             "procedureCodeText": None,
             "procedureStatus": None,
             "procedurePerformedDateTime": None,
             "procedureFollowUp": None,
             "procedureNote": None,
+            # AllergyIntolerance
             "allergyId": None,
             "allergyClinicalStatus": None,
             "allergyVerificationStatus": None,
@@ -508,345 +541,447 @@ def parse_fhir_bundle(bundle_json: Dict) -> Tuple[List[Dict], List[Tuple[str, st
             "allergyCodeText": None,
             "allergyOnsetDateTime": None,
             "allergyNote": None,
+            # Practitioner
             "practitionerId": None,
             "practitionerName": None,
             "practitionerGender": None,
             "practitionerSpecialty": None,
             "practitionerAddress": None,
             "practitionerTelecom": None,
+            # Organization
             "organizationId": None,
             "organizationName": None,
             "organizationType": None,
             "organizationAddress": None,
             "organizationTelecom": None,
+            # We do not store embeddings in structured docs
+            # unstructured docs will have "embedding" once we embed them
         }
 
-        unstructured_pieces = []
+        # gather unstructured text from various narrative or note fields
+        unstructured_text_pieces = []
+
+        # resource.text.div
         div_text = resource.get("text", {}).get("div", "")
         if div_text.strip():
-            unstructured_pieces.append(div_text)
+            unstructured_text_pieces.append(div_text)
 
-        # Parse Patient
+        # now parse resource-specific logic:
         if rtype == "Patient":
             sdoc["patientId"] = rid
             sdoc["patientGender"] = resource.get("gender")
             sdoc["patientDOB"] = resource.get("birthDate")
+
             if "name" in resource and len(resource["name"]) > 0:
-                nm = resource["name"][0]
-                f_ = nm.get("family", "")
-                g_ = " ".join(nm.get("given", []))
-                sdoc["patientName"] = (g_ + " " + f_).strip()
+                n = resource["name"][0]
+                family = n.get("family", "")
+                given = " ".join(n.get("given", []))
+                sdoc["patientName"] = f"{given} {family}".strip()
+
+            # address
             if "address" in resource and len(resource["address"]) > 0:
-                a0 = resource["address"][0]
-                lines = a0.get("line", [])
-                city = a0.get("city", "")
-                state = a0.get("state", "")
-                postal = a0.get("postalCode", "")
-                sdoc["patientAddress"] = " ".join(lines + [city, state, postal]).strip()
+                addr = resource["address"][0]
+                lines = addr.get("line", [])
+                city = addr.get("city", "")
+                state = addr.get("state", "")
+                postal = addr.get("postalCode", "")
+                address_str = " ".join(lines + [city, state, postal]).strip()
+                sdoc["patientAddress"] = address_str
+
+            # maritalStatus
             if "maritalStatus" in resource:
-                ms = resource["maritalStatus"]
-                sdoc["patientMaritalStatus"] = ms.get("text") or ms.get("coding", [{}])[
-                    0
-                ].get("code")
+                # ms = resource["maritalStatus"]
+                # sdoc["patientMaritalStatus"] = ms.get("text") or ms.get("coding", [{}])[
+                #     0
+                # ].get("code")
+                sdoc["patientMaritalStatus"] = extract_code_text(
+                    resource["maritalStatus"]
+                )
+
+            # multipleBirth
             if "multipleBirthInteger" in resource:
                 sdoc["patientMultipleBirth"] = resource["multipleBirthInteger"]
             elif "multipleBirthBoolean" in resource:
+                # store as 1 or 0 or keep boolean as integer
                 sdoc["patientMultipleBirth"] = (
                     1 if resource["multipleBirthBoolean"] else 0
                 )
+
+            # telecom
             if "telecom" in resource:
-                tarr = []
+                telecom_strs = []
                 for t in resource["telecom"]:
                     use = t.get("use", "")
                     val = t.get("value", "")
-                    tarr.append(use + ":" + val)
-                sdoc["patientTelecom"] = " | ".join(tarr)
-            if "communication" in resource and len(resource["communication"]) > 0:
-                first_comm = resource["communication"][0]
-                lang_obj = first_comm.get("language", {})
-                sdoc["patientLanguage"] = lang_obj.get("text") or lang_obj.get(
-                    "coding", [{}]
-                )[0].get("code")
+                    telecom_strs.append(f"{use}: {val}")
+                if telecom_strs:
+                    sdoc["patientTelecom"] = " | ".join(telecom_strs)
 
-        # Parse Condition
+            # language
+            if "communication" in resource and len(resource["communication"]) > 0:
+                # take first
+                comm = resource["communication"][0]
+                # c_lang = comm.get("language", {})
+                # sdoc["patientLanguage"] = c_lang.get("text") or c_lang.get(
+                #     "coding", [{}]
+                # )[0].get("code")
+                sdoc["patientLanguage"] = extract_code_text(comm.get("language", {}))
+
         elif rtype == "Condition":
             sdoc["conditionId"] = rid
-            cstatus = resource.get("clinicalStatus", {})
-            sdoc["conditionClinicalStatus"] = cstatus.get("text") or cstatus.get(
-                "coding", [{}]
-            )[0].get("code")
-            vstatus = resource.get("verificationStatus", {})
-            sdoc["conditionVerificationStatus"] = vstatus.get("text") or vstatus.get(
-                "coding", [{}]
-            )[0].get("code")
+            # cstatus = resource.get("clinicalStatus", {})
+            # sdoc["conditionClinicalStatus"] = cstatus.get("text") or cstatus.get(
+            #     "coding", [{}]
+            # )[0].get("code")
+
+            sdoc["conditionClinicalStatus"] = extract_code_text(
+                resource.get("clinicalStatus", {})
+            )
+
+            # vstatus = resource.get("verificationStatus", {})
+            # sdoc["conditionVerificationStatus"] = vstatus.get("text") or vstatus.get(
+            #     "coding", [{}]
+            # )[0].get("code")
+            sdoc["conditionVerificationStatus"] = extract_code_text(
+                resource.get("verificationStatus", {})
+            )
+
+            # category
             if "category" in resource and len(resource["category"]) > 0:
-                cat_ = resource["category"][0]
-                sdoc["conditionCategory"] = cat_.get("text") or cat_.get(
-                    "coding", [{}]
-                )[0].get("code")
+                cat = resource["category"][0]
+                # sdoc["conditionCategory"] = cat.get("text") or cat.get("coding", [{}])[
+                #     0
+                # ].get("code")
+                sdoc["conditionCategory"] = extract_code_text(cat)
+
+            # severity
             if "severity" in resource:
                 sev = resource["severity"]
-                sdoc["conditionSeverity"] = sev.get("text") or sev.get("coding", [{}])[
-                    0
-                ].get("code")
-            c_field = resource.get("code", {})
-            code_txt = c_field.get("text", "")
-            if not code_txt and "coding" in c_field and len(c_field["coding"]) > 0:
-                code_txt = c_field["coding"][0].get("display", "")
-            sdoc["conditionCodeText"] = code_txt
+                # sdoc["conditionSeverity"] = sev.get("text") or sev.get("coding", [{}])[
+                #     0
+                # ].get("code")
+                sdoc["conditionSeverity"] = extract_code_text(sev)
+
+            code_field = resource.get("code", {})
+            ctext = code_field.get("text")
+            if not ctext and "coding" in code_field and len(code_field["coding"]) > 0:
+                ctext = code_field["coding"][0].get("display", "")
+            sdoc["conditionCodeText"] = ctext
+
             sdoc["conditionOnsetDateTime"] = resource.get("onsetDateTime")
             sdoc["conditionRecordedDate"] = resource.get("recordedDate")
-            if "note" in resource:
-                notes_ = []
-                for note_item in resource["note"]:
-                    n_txt = note_item.get("text", "").strip()
-                    if n_txt:
-                        notes_.append(n_txt)
-                if notes_:
-                    sdoc["conditionNote"] = " | ".join(notes_)
-                    unstructured_pieces.extend(notes_)
 
-        # Parse Observation
+            # Condition note => unstructured
+            if "note" in resource:
+                all_notes = []
+                for note_item in resource["note"]:
+                    note_txt = note_item.get("text", "").strip()
+                    if note_txt:
+                        all_notes.append(note_txt)
+                if all_notes:
+                    sdoc["conditionNote"] = " | ".join(all_notes)
+                    unstructured_text_pieces.extend(all_notes)
+
         elif rtype == "Observation":
             sdoc["observationId"] = rid
-            c_obj = resource.get("code", {})
-            obs_code_text = c_obj.get("text", "")
-            if not obs_code_text and "coding" in c_obj and len(c_obj["coding"]) > 0:
-                obs_code_text = c_obj["coding"][0].get("display", "")
+            code_info = resource.get("code", {})
+            obs_code_text = code_info.get("text")
+            if (
+                not obs_code_text
+                and "coding" in code_info
+                and len(code_info["coding"]) > 0
+            ):
+                obs_code_text = code_info["coding"][0].get("display", "")
             sdoc["observationCodeText"] = obs_code_text
+
+            # quantity
             if "valueQuantity" in resource:
-                val_ = resource["valueQuantity"].get("value", "")
-                un_ = resource["valueQuantity"].get("unit", "")
-                sdoc["observationValue"] = str(val_)
-                sdoc["observationUnit"] = un_
+                val = resource["valueQuantity"].get("value", "")
+                un = resource["valueQuantity"].get("unit", "")
+                sdoc["observationValue"] = str(val)
+                sdoc["observationUnit"] = un
+
             if "interpretation" in resource and len(resource["interpretation"]) > 0:
-                first_i = resource["interpretation"][0]
-                inter_txt = first_i.get("text") or first_i.get("coding", [{}])[0].get(
-                    "code"
-                )
-                sdoc["observationInterpretation"] = inter_txt
+                first_interp = resource["interpretation"][0]
+                sdoc["observationInterpretation"] = first_interp.get(
+                    "text"
+                ) or first_interp.get("coding", [{}])[0].get("code")
+
             sdoc["observationEffectiveDateTime"] = resource.get("effectiveDateTime")
             sdoc["observationIssued"] = resource.get("issued")
+
             if "referenceRange" in resource and len(resource["referenceRange"]) > 0:
-                rng_list = []
-                for rng_item in resource["referenceRange"]:
-                    l_ = rng_item.get("low", {}).get("value", "")
-                    h_ = rng_item.get("high", {}).get("value", "")
-                    rng_list.append(f"Low:{l_},High:{h_}")
-                if rng_list:
-                    sdoc["observationReferenceRange"] = " ; ".join(rng_list)
+                # store them as text
+                range_list = []
+                for rr in resource["referenceRange"]:
+                    low = rr.get("low", {}).get("value", "")
+                    high = rr.get("high", {}).get("value", "")
+                    range_str = f"Low: {low}, High: {high}".strip()
+                    range_list.append(range_str)
+                if range_list:
+                    sdoc["observationReferenceRange"] = " ; ".join(range_list)
+
             if "note" in resource:
                 obs_notes = []
                 for nt in resource["note"]:
-                    obs_txt = nt.get("text", "").strip()
-                    if obs_txt:
-                        obs_notes.append(obs_txt)
+                    t = nt.get("text", "").strip()
+                    if t:
+                        obs_notes.append(t)
                 if obs_notes:
                     sdoc["observationNote"] = " | ".join(obs_notes)
-                    unstructured_pieces.extend(obs_notes)
+                    unstructured_text_pieces.extend(obs_notes)
 
-        # Parse Encounter
         elif rtype == "Encounter":
             sdoc["encounterId"] = rid
             sdoc["encounterStatus"] = resource.get("status")
             sdoc["encounterClass"] = resource.get("class", {}).get("code")
             if "type" in resource and len(resource["type"]) > 0:
-                first_enc_type = resource["type"][0]
-                e_text = first_enc_type.get("text") or first_enc_type.get(
-                    "coding", [{}]
-                )[0].get("display", "")
-                sdoc["encounterType"] = e_text
-            if "reasonCode" in resource and len(resource["reasonCode"]) > 0:
-                rcode0 = resource["reasonCode"][0]
-                r_text = rcode0.get("text") or rcode0.get("coding", [{}])[0].get(
-                    "display", ""
+                t = resource["type"][0]
+                sdoc["encounterType"] = t.get("text") or t.get("coding", [{}])[0].get(
+                    "display"
                 )
-                sdoc["encounterReasonCode"] = r_text
-            period_ = resource.get("period", {})
-            sdoc["encounterStart"] = period_.get("start")
-            sdoc["encounterEnd"] = period_.get("end")
-            if "location" in resource and len(resource["location"]) > 0:
-                loc0 = resource["location"][0]
-                loc_disp = loc0.get("location", {}).get("display", "")
-                sdoc["encounterLocation"] = loc_disp
-            if "serviceProvider" in resource:
-                sp_ = resource["serviceProvider"]
-                sdoc["encounterServiceProvider"] = sp_.get("reference")
-            if "participant" in resource and len(resource["participant"]) > 0:
-                parts = []
-                for pp in resource["participant"]:
-                    ind_ = pp.get("individual", {})
-                    dsp_ = ind_.get("display", "")
-                    parts.append(dsp_)
-                if parts:
-                    sdoc["encounterParticipant"] = " | ".join(parts)
-            if "note" in resource:
-                e_notes = []
-                for note_ in resource["note"]:
-                    e_txt = note_.get("text", "").strip()
-                    if e_txt:
-                        e_notes.append(e_txt)
-                if e_notes:
-                    sdoc["encounterNote"] = " | ".join(e_notes)
-                    unstructured_pieces.extend(e_notes)
 
-        # Parse MedicationRequest
+            if "reasonCode" in resource and len(resource["reasonCode"]) > 0:
+                rc = resource["reasonCode"][0]
+                sdoc["encounterReasonCode"] = rc.get("text") or rc.get("coding", [{}])[
+                    0
+                ].get("display")
+
+            period = resource.get("period", {})
+            sdoc["encounterStart"] = period.get("start")
+            sdoc["encounterEnd"] = period.get("end")
+
+            if "location" in resource and len(resource["location"]) > 0:
+                first_loc = resource["location"][0]
+                loc_display = first_loc.get("location", {}).get("display", "")
+                sdoc["encounterLocation"] = loc_display
+
+            if "serviceProvider" in resource:
+                sp = resource["serviceProvider"]
+                # might be a reference
+                sdoc["encounterServiceProvider"] = sp.get("reference")
+
+            if "participant" in resource and len(resource["participant"]) > 0:
+                participants = []
+                for p in resource["participant"]:
+                    ip = p.get("individual", {})
+                    p_disp = ip.get("display", "")
+                    participants.append(p_disp)
+                if participants:
+                    sdoc["encounterParticipant"] = " | ".join(participants)
+
+            if "note" in resource:
+                enc_notes = []
+                for note_item in resource["note"]:
+                    note_txt = note_item.get("text", "").strip()
+                    if note_txt:
+                        enc_notes.append(note_txt)
+                if enc_notes:
+                    sdoc["encounterNote"] = " | ".join(enc_notes)
+                    unstructured_text_pieces.extend(enc_notes)
+
         elif rtype == "MedicationRequest":
             sdoc["medRequestId"] = rid
             sdoc["medRequestIntent"] = resource.get("intent")
             sdoc["medRequestStatus"] = resource.get("status")
             sdoc["medRequestPriority"] = resource.get("priority")
             sdoc["medRequestAuthoredOn"] = resource.get("authoredOn")
+
             med_code = resource.get("medicationCodeableConcept", {})
-            med_text = med_code.get("text", "")
+            med_text = med_code.get("text")
             if (not med_text) and "coding" in med_code and len(med_code["coding"]) > 0:
                 med_text = med_code["coding"][0].get("display", "")
             sdoc["medRequestMedicationDisplay"] = med_text
+
+            # dosageInstruction
             if (
                 "dosageInstruction" in resource
                 and len(resource["dosageInstruction"]) > 0
             ):
-                dosage_list = []
-                for d_i in resource["dosageInstruction"]:
-                    d_txt = d_i.get("text", "")
-                    dosage_list.append(d_txt)
-                if dosage_list:
-                    sdoc["medRequestDosageInstruction"] = " | ".join(dosage_list)
+                d_strs = []
+                for di in resource["dosageInstruction"]:
+                    txt = di.get("text", "")
+                    d_strs.append(txt)
+                if d_strs:
+                    sdoc["medRequestDosageInstruction"] = " | ".join(d_strs)
+
+            # dispenseRequest
             if "dispenseRequest" in resource:
-                dr_ = resource["dispenseRequest"]
-                sdoc["medRequestDispenseRequest"] = json.dumps(dr_)
+                dr = resource["dispenseRequest"]
+                sdoc["medRequestDispenseRequest"] = json.dumps(dr)
+
+            # note
             if "note" in resource:
                 mr_notes = []
-                for note_ in resource["note"]:
-                    n_txt = note_.get("text", "").strip()
-                    if n_txt:
-                        mr_notes.append(n_txt)
+                for n in resource["note"]:
+                    txt = n.get("text", "").strip()
+                    if txt:
+                        mr_notes.append(txt)
                 if mr_notes:
                     sdoc["medRequestNote"] = " | ".join(mr_notes)
-                    unstructured_pieces.extend(mr_notes)
+                    unstructured_text_pieces.extend(mr_notes)
 
-        # Parse Procedure
         elif rtype == "Procedure":
             sdoc["procedureId"] = rid
             sdoc["procedureStatus"] = resource.get("status")
-            c_ = resource.get("code", {})
-            c_text = c_.get("text") or c_.get("coding", [{}])[0].get("display")
+            c = resource.get("code", {})
+            c_text = c.get("text") or c.get("coding", [{}])[0].get("display")
             sdoc["procedureCodeText"] = c_text
             if "performedDateTime" in resource:
                 sdoc["procedurePerformedDateTime"] = resource["performedDateTime"]
             if "followUp" in resource and len(resource["followUp"]) > 0:
-                f_u_arr = []
-                for f_item in resource["followUp"]:
-                    fu_txt = f_item.get("text", "")
-                    f_u_arr.append(fu_txt)
-                if f_u_arr:
-                    sdoc["procedureFollowUp"] = " | ".join(f_u_arr)
+                fu_arr = []
+                for f in resource["followUp"]:
+                    fu_txt = f.get("text", "")
+                    fu_arr.append(fu_txt)
+                if fu_arr:
+                    sdoc["procedureFollowUp"] = " | ".join(fu_arr)
+
             if "note" in resource:
                 proc_notes = []
-                for pn in resource["note"]:
-                    t_ = pn.get("text", "").strip()
-                    if t_:
-                        proc_notes.append(t_)
+                for n in resource["note"]:
+                    t = n.get("text", "").strip()
+                    if t:
+                        proc_notes.append(t)
                 if proc_notes:
                     sdoc["procedureNote"] = " | ".join(proc_notes)
-                    unstructured_pieces.extend(proc_notes)
+                    unstructured_text_pieces.extend(proc_notes)
 
-        # Parse AllergyIntolerance
         elif rtype == "AllergyIntolerance":
             sdoc["allergyId"] = rid
-            acs = resource.get("clinicalStatus", {})
-            sdoc["allergyClinicalStatus"] = acs.get("text")
-            avs = resource.get("verificationStatus", {})
-            sdoc["allergyVerificationStatus"] = avs.get("text")
+            # sdoc["allergyClinicalStatus"] = resource.get("clinicalStatus", {}).get(
+            #     "text"
+            # )
+            sdoc["allergyClinicalStatus"] = extract_code_text(
+                resource.get("clinicalStatus")
+            )
+            # sdoc["allergyVerificationStatus"] = resource.get(
+            #     "verificationStatus", {}
+            # ).get("text")
+            sdoc["allergyVerificationStatus"] = extract_code_text(
+                resource.get("verificationStatus")
+            )
+
             sdoc["allergyType"] = resource.get("type")
             if "category" in resource and len(resource["category"]) > 0:
-                sdoc["allergyCategory"] = resource["category"][0]
+                # sdoc["allergyCategory"] = resource["category"][0]
+                catval = resource["category"][0]
+                sdoc["allergyCategory"] = extract_code_text(catval)
+
             sdoc["allergyCriticality"] = resource.get("criticality")
-            acode = resource.get("code", {})
-            a_txt = acode.get("text", "")
-            if not a_txt and "coding" in acode and len(acode["coding"]) > 0:
-                a_txt = acode["coding"][0].get("display", "")
-            sdoc["allergyCodeText"] = a_txt
+
+            code_field = resource.get("code", {})
+            all_text = code_field.get("text")
+            if (
+                not all_text
+                and "coding" in code_field
+                and len(code_field["coding"]) > 0
+            ):
+                all_text = code_field["coding"][0].get("display", "")
+            sdoc["allergyCodeText"] = all_text
+
             sdoc["allergyOnsetDateTime"] = resource.get("onsetDateTime")
+
             if "note" in resource:
                 a_notes = []
-                for an in resource["note"]:
-                    a_ntext = an.get("text", "").strip()
-                    if a_ntext:
-                        a_notes.append(a_ntext)
+                for note in resource["note"]:
+                    ntxt = note.get("text", "").strip()
+                    if ntxt:
+                        a_notes.append(ntxt)
+
                 if a_notes:
                     sdoc["allergyNote"] = " | ".join(a_notes)
-                    unstructured_pieces.extend(a_notes)
+                    unstructured_text_pieces.extend(a_notes)
 
-        # Parse Practitioner
         elif rtype == "Practitioner":
             sdoc["practitionerId"] = rid
             if "name" in resource and len(resource["name"]) > 0:
-                nm_ = resource["name"][0]
-                fam_ = nm_.get("family", "")
-                gvn_ = " ".join(nm_.get("given", []))
-                sdoc["practitionerName"] = (gvn_ + " " + fam_).strip()
+                nm = resource["name"][0]
+                p_fam = nm.get("family", "")
+                p_giv = " ".join(nm.get("given", []))
+                sdoc["practitionerName"] = f"{p_giv} {p_fam}".strip()
             sdoc["practitionerGender"] = resource.get("gender")
-            if "qualification" in resource and len(resource["qualification"]) > 0:
-                q_ = resource["qualification"][0]
-                sdoc["practitionerSpecialty"] = q_.get("code", {}).get("text")
-            if "address" in resource and len(resource["address"]) > 0:
-                addr_ = resource["address"][0]
-                lines_ = addr_.get("line", [])
-                city_ = addr_.get("city", "")
-                state_ = addr_.get("state", "")
-                postal_ = addr_.get("postalCode", "")
-                sdoc["practitionerAddress"] = " ".join(
-                    lines_ + [city_, state_, postal_]
-                ).strip()
-            if "telecom" in resource:
-                tel_arr = []
-                for t__ in resource["telecom"]:
-                    use_ = t__.get("use", "")
-                    val_ = t__.get("value", "")
-                    tel_arr.append(use_ + ":" + val_)
-                if tel_arr:
-                    sdoc["practitionerTelecom"] = " | ".join(tel_arr)
 
-        # Parse Organization
+            if "qualification" in resource and len(resource["qualification"]) > 0:
+                # interpret "qualification" as specialty
+                q = resource["qualification"][0]
+                # sdoc["practitionerSpecialty"] = q.get("code", {}).get("text")
+                sdoc["practitionerSpecialty"] = extract_code_text(q.get("code", {}))
+
+            if "address" in resource and len(resource["address"]) > 0:
+                adr = resource["address"][0]
+                lines = adr.get("line", [])
+                city = adr.get("city", "")
+                state = adr.get("state", "")
+                postal = adr.get("postalCode", "")
+                paddr_str = " ".join(lines + [city, state, postal]).strip()
+                sdoc["practitionerAddress"] = paddr_str
+
+            if "telecom" in resource:
+                tele_arr = []
+                for t in resource["telecom"]:
+                    use = t.get("use", "")
+                    val = t.get("value", "")
+                    tele_arr.append(f"{use}: {val}")
+                if tele_arr:
+                    sdoc["practitionerTelecom"] = " | ".join(tele_arr)
+
         elif rtype == "Organization":
             sdoc["organizationId"] = rid
             sdoc["organizationName"] = resource.get("name")
             if "type" in resource and len(resource["type"]) > 0:
-                typ0 = resource["type"][0]
-                sdoc["organizationType"] = typ0.get("text") or typ0.get("coding", [{}])[
+                t0 = resource["type"][0]
+                sdoc["organizationType"] = t0.get("text") or t0.get("coding", [{}])[
                     0
                 ].get("code")
+
             if "address" in resource and len(resource["address"]) > 0:
                 org_adr = resource["address"][0]
-                lines_ = org_adr.get("line", [])
-                city_ = org_adr.get("city", "")
-                state_ = org_adr.get("state", "")
-                postal_ = org_adr.get("postalCode", "")
-                sdoc["organizationAddress"] = " ".join(
-                    lines_ + [city_, state_, postal_]
-                ).strip()
+                lines = org_adr.get("line", [])
+                city = org_adr.get("city", "")
+                state = org_adr.get("state", "")
+                postal = org_adr.get("postalCode", "")
+                org_addr_str = " ".join(lines + [city, state, postal]).strip()
+                sdoc["organizationAddress"] = org_addr_str
+
             if "telecom" in resource:
-                ot_arr = []
-                for t__ in resource["telecom"]:
-                    use_ = t__.get("use", "")
-                    val_ = t__.get("value", "")
-                    ot_arr.append(use_ + ":" + val_)
-                if ot_arr:
-                    sdoc["organizationTelecom"] = " | ".join(ot_arr)
+                otele_arr = []
+                for t in resource["telecom"]:
+                    use = t.get("use", "")
+                    val = t.get("value", "")
+                    otele_arr.append(f"{use}: {val}")
+                if otele_arr:
+                    sdoc["organizationTelecom"] = " | ".join(otele_arr)
 
+        # add the structured doc
         structured_docs.append(sdoc)
-        if unstructured_pieces:
-            combined_text = "\n".join(unstructured_pieces).strip()
-            if combined_text:
-                unstructured_data.append((rtype, combined_text))
 
-    return structured_docs, unstructured_data
+        # chunk unstructured text for embedding as these are notes, we set
+        # doc_type="unstructured". Each chunk becomes a separate doc due to chunking
+        if unstructured_text_pieces:
+            combined_text = "\n".join(unstructured_text_pieces).strip()
+            if not combined_text:
+                continue
+
+            # chunk long text
+            text_chunks = chunk_text(combined_text, chunk_size=CHUNK_SIZE)
+            for c_i, chunk_str in enumerate(text_chunks):
+                unstructured_docs.append(
+                    {
+                        "doc_id": f"{rtype}-{rid}-unstructured-{c_i}",
+                        "doc_type": "unstructured",
+                        "resourceType": rtype,
+                        # storing the text in 'unstructuredText' field
+                        "unstructuredText": chunk_str,
+                    }
+                )
+
+    return (structured_docs, unstructured_docs)
 
 
-###############################################################################
+###############################################################
 # Endpoint: upload data => handle text (or) Json/FHIR
-###############################################################################
+#############################################################
 @app.post("/upload_data")
 async def upload_data(user_id: str = Form(...), files: List[UploadFile] = File(...)):
     authorized = await check_user_authorized(user_id)
@@ -939,11 +1074,14 @@ async def upload_data(user_id: str = Form(...), files: List[UploadFile] = File(.
             except Exception as e:
                 raise HTTPException(status_code=400, detail=f"JSON parse error: {e}")
 
-            structured_docs, unstructured_data = parse_fhir_bundle(bundle_json)
+            structured_docs, unstructured_docs = parse_fhir_bundle(bundle_json)
             bulk_index_structured(user_id, doc_id, structured_docs)
-            for resType, raw_text in unstructured_data:
-                if raw_text.strip():
-                    un_chunks = chunk_text(raw_text, CHUNK_SIZE)
+            for udoc in unstructured_docs:
+                text = udoc.get("unstructuredText", "")
+                resType = udoc.get("resourceType", "")
+                sub_doc_id = udoc.get("doc_id", f"{doc_id}_{resType}")
+                if text.strip():
+                    un_chunks = chunk_text(text, CHUNK_SIZE)
                     un_embs = await embed_texts_in_batches(un_chunks)
                     if un_embs.shape[0] != len(un_chunks):
                         raise HTTPException(
@@ -951,7 +1089,6 @@ async def upload_data(user_id: str = Form(...), files: List[UploadFile] = File(.
                             detail="Mismatch chunk vs embedding count for unstructured text in FHIR.",
                         )
 
-                    sub_doc_id = f"{doc_id}_{resType}"
                     bulk_index_unstructured(
                         user_id, sub_doc_id, un_chunks, un_embs, resourceType=resType
                     )
