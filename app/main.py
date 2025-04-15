@@ -10,7 +10,6 @@ from contextlib import asynccontextmanager
 import httpx
 import uvicorn
 
-import concurrent.futures
 
 from prisma import Prisma
 
@@ -28,6 +27,8 @@ from opensearchpy import OpenSearch, RequestsHttpConnection
 from opensearchpy.helpers import bulk
 
 from transformers import pipeline
+import torch
+from datetime import datetime, timezone
 
 import logging
 from pathlib import Path
@@ -1081,6 +1082,15 @@ def parse_fhir_bundle_with_path(
     return structured_docs, unstructured_docs
 
 
+def infer_patient_id_from_filename(filename: str) -> Optional[str]:
+    """
+    Infer patientId from filename, e.g., 'patient_123_notes.md' -> '123'.
+    Returns None if no patientId is found.
+    """
+    match = re.search(r"patient_(\d+)", filename, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
 def parse_text_file(file_path: str, file_type: str) -> Tuple[List[Dict], List[Dict]]:
     structured_docs = []
     unstructured_docs = []
@@ -1106,6 +1116,7 @@ def parse_text_file(file_path: str, file_type: str) -> Tuple[List[Dict], List[Di
     if not content:
         logger.warning(f"Empty text file: {file_path}")
         return structured_docs, unstructured_docs
+
     text_chunks = chunk_text(content, chunk_size=CHUNK_SIZE)
     for i, chunk in enumerate(text_chunks):
         doc_id = f"{file_type}-{absolute_path.stem}-{i}"
@@ -1120,6 +1131,7 @@ def parse_text_file(file_path: str, file_type: str) -> Tuple[List[Dict], List[Di
                 "unstructuredText": chunk,
             }
         )
+
     return structured_docs, unstructured_docs
 
 
@@ -1180,13 +1192,21 @@ async def store_fhir_docs_in_opensearch(
         bulk_actions_unstruct.append(action_unstruct)
 
         if len(bulk_actions_unstruct) >= BATCH_SIZE:
-            u_success, u_errors = bulk(client, bulk_actions_unstruct)
-            print(f"[FHIR] Indexed {u_success} unstructured docs. Errors: {u_errors}")
-            bulk_actions_unstruct = []
+            try:
+                u_success, u_errors = bulk(client, bulk_actions_unstruct)
+                logger.info(
+                    f"Indexed {u_success} unstructured docs, errors: {u_errors}"
+                )
+                bulk_actions_unstruct = []
+            except Exception as e:
+                logger.error(f"Unstructured docs indexing error: {e}")
 
     if bulk_actions_unstruct:
-        u_success, u_errors = bulk(client, bulk_actions_unstruct)
-        print(f"[FHIR] Indexed {u_success} unstructured docs. Errors: {u_errors}")
+        try:
+            u_success, u_errors = bulk(client, bulk_actions_unstruct)
+            logger.info(f"Indexed {u_success} unstructured docs, errors: {u_errors}")
+        except Exception as e:
+            logger.error(f"Unstructured docs indexing error: {e}")
 
 
 async def ingest_fhir_directory(fhir_dir: str, user_id: str) -> None:
@@ -1226,6 +1246,53 @@ async def ingest_fhir_directory(fhir_dir: str, user_id: str) -> None:
             )
         except Exception as e:
             logger.error(f"Error processing {path}: {e}")
+
+
+def validate_file_path(
+    file_path: str, base_dir: str = None, read: bool = False
+) -> Optional[Path]:
+    """
+    Validate a file path. If base_dir is provided, treat file_path as relative.
+    If read=True, check readability.
+    Accepts .json, .md, .txt files.
+    Returns Path object if valid, None otherwise.
+    """
+    try:
+        if base_dir:
+            path = Path(base_dir) / file_path
+        else:
+            path = Path(file_path)
+
+        path = path.resolve()
+        if not path.exists():
+            logger.error(f"File does not exist: {path}")
+            return None
+
+        if not path.is_file():
+            logger.error(f"Path is not a file: {path}")
+            return None
+
+        if path.suffix.lower() not in SUPPORTED_FILE_EXTENSIONS:
+            logger.error(f"Unsupported file extension: {path}")
+            return None
+
+        if read:
+            with path.open("r", encoding="utf-8") as f:
+                content = f.read()
+                if not content.strip():
+                    logger.error(f"File is empty: {path}")
+                    return None
+
+        return path
+    except PermissionError:
+        logger.error(f"Permission denied for file: {path}")
+        return None
+    except UnicodeDecodeError:
+        logger.error(f"File is not valid UTF-8: {path}")
+        return None
+    except Exception as e:
+        logger.error(f"Invalid file path {path}: {e}")
+        return None
 
 
 async def retrieve_ehr_document(file_path: str) -> Optional[Dict]:
@@ -1339,18 +1406,18 @@ class OpenSearchIndexer:
 
     def exact_match_search(
         self,
-        query_text: str,
+        query: str,
         k: int = TOP_K,
         filter_clause: Optional[Dict] = None,
         patient_id: Optional[str] = None,
     ) -> List[Tuple[Dict, float]]:
-        if not query_text.strip():
+        if not query.strip():
             return []
         bool_query = {
             "should": [
                 {
                     "multi_match": {
-                        "query": query_text,
+                        "query": query,
                         "fields": self.text_fields,
                         "type": "phrase",
                         "boost": 2.0,
@@ -1358,7 +1425,7 @@ class OpenSearchIndexer:
                 },
                 {
                     "multi_match": {
-                        "query": query_text,
+                        "query": query,
                         "fields": self.keyword_fields,
                         "type": "phrase",
                     }
@@ -1421,13 +1488,13 @@ class OpenSearchIndexer:
 
     def hybrid_search(
         self,
-        query_text: str,
+        query: str,
         query_emb: np.ndarray,
         k: int = TOP_K,
         filter_clause: Optional[Dict] = None,
         patient_id: Optional[str] = None,
     ) -> List[Tuple[Dict, float]]:
-        if not query_text.strip() or query_emb.size == 0:
+        if not query.strip() or query_emb.size == 0:
             return []
         norms = np.linalg.norm(query_emb, axis=1, keepdims=True)
         vector = (query_emb / (norms + 1e-9))[0].tolist()
@@ -1435,7 +1502,7 @@ class OpenSearchIndexer:
             "should": [
                 {
                     "multi_match": {
-                        "query": query_text,
+                        "query": query,
                         "fields": self.text_fields,
                         "type": "best_fields",
                         "operator": "or",
@@ -1445,7 +1512,7 @@ class OpenSearchIndexer:
                 },
                 {
                     "multi_match": {
-                        "query": query_text,
+                        "query": query,
                         "fields": self.keyword_fields,
                         "type": "best_fields",
                         "operator": "or",
@@ -1476,12 +1543,12 @@ class OpenSearchIndexer:
 
     def structured_search(
         self,
-        query_text: str,
+        query: str,
         k: int = TOP_K,
         filter_clause: Optional[Dict] = None,
         patient_id: Optional[str] = None,
     ) -> List[Tuple[Dict, float]]:
-        if not query_text.strip():
+        if not query.strip():
             return []
         structured_fields = [
             "patientName^3",
@@ -1509,7 +1576,7 @@ class OpenSearchIndexer:
             "must": [
                 {
                     "multi_match": {
-                        "query": query_text,
+                        "query": query,
                         "fields": structured_fields,
                         "type": "phrase_prefix",
                         "operator": "and",
@@ -1538,13 +1605,13 @@ class OpenSearchIndexer:
 
     def hybrid_structured_search(
         self,
-        query_text: str,
+        query: str,
         query_emb: np.ndarray,
         k: int = TOP_K,
         filter_clause: Optional[Dict] = None,
         patient_id: Optional[str] = None,
     ) -> List[Tuple[Dict, float]]:
-        if not query_text.strip() or query_emb.size == 0:
+        if not query.strip() or query_emb.size == 0:
             return []
         norms = np.linalg.norm(query_emb, axis=1, keepdims=True)
         vector = (query_emb / (norms + 1e-9))[0].tolist()
@@ -1573,7 +1640,7 @@ class OpenSearchIndexer:
             "should": [
                 {
                     "multi_match": {
-                        "query": query_text,
+                        "query": query,
                         "fields": structured_fields,
                         "type": "phrase_prefix",
                         "operator": "and",
@@ -1966,60 +2033,11 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
     return chunks
 
 
-def validate_file_path(
-    file_path: str, base_dir: str = None, read: bool = False
-) -> Optional[Path]:
-    """
-    Validate a file path. If base_dir is provided, treat file_path as relative.
-    If read=True, check readability.
-    Accepts .json, .md, .txt files.
-    Returns Path object if valid, None otherwise.
-    """
-    try:
-        if base_dir:
-            path = Path(base_dir) / file_path
-        else:
-            path = Path(file_path)
-        path = path.resolve()
-        if not path.exists():
-            logger.error(f"File does not exist: {path}")
-            return None
-        if not path.is_file():
-            logger.error(f"Path is not a file: {path}")
-            return None
-        if path.suffix.lower() not in SUPPORTED_FILE_EXTENSIONS:
-            logger.error(f"Unsupported file extension: {path}")
-            return None
-        if read:
-            with path.open("r", encoding="utf-8") as f:
-                content = f.read()
-                if not content.strip():
-                    logger.error(f"File is empty: {path}")
-                    return None
-        return path
-    except PermissionError:
-        logger.error(f"Permission denied for file: {path}")
-        return None
-    except UnicodeDecodeError:
-        logger.error(f"File is not valid UTF-8: {path}")
-        return None
-    except Exception as e:
-        logger.error(f"Invalid file path {path}: {e}")
-        return None
-
-
-def infer_patient_id_from_filename(filename: str) -> Optional[str]:
-    """
-    Infer patientId from filename, e.g., 'patient_123_notes.md' -> '123'.
-    Returns None if no patientId is found.
-    """
-    match = re.search(r"patient_(\d+)", filename, re.IGNORECASE)
-    return match.group(1) if match else None
-
-
-# Intent classifier (zero-shot)
+# Initialize the model pipeline
 intent_classifier = pipeline(
-    "zero-shot-classification", model=QUERY_INTENT_CLASSIFICATION_MODEL
+    "zero-shot-classification",
+    model=QUERY_INTENT_CLASSIFICATION_MODEL,
+    device=0 if torch.cuda.is_available() else -1,
 )
 
 # Intent categories
@@ -2037,6 +2055,27 @@ INTENT_CATEGORIES = [
     "ENTITY_SPECIFIC",
     "DOCUMENT_FETCH",
 ]
+
+# Few-shot examples embedded in the classifier prompt
+FEW_SHOT_EXAMPLES = """
+Classify the query into one of these intents: SEMANTIC, KEYWORD, HYBRID, STRUCTURED, HYBRID_STRUCTURED, AGGREGATE, COMPARISON, TEMPORAL, EXPLANATORY, MULTI_INTENT, ENTITY_SPECIFIC, DOCUMENT_FETCH.
+
+Examples:
+1. Query: "What are the symptoms of diabetes?" Intent: EXPLANATORY
+2. Query: "Fetch the medical records for patient John Doe." Intent: DOCUMENT_FETCH
+3. Query: "How many patients have hypertension?" Intent: AGGREGATE
+4. Query: "Compare the outcomes of heart surgery vs. medication." Intent: COMPARISON
+5. Query: "Show me trends in blood pressure for patient 123 over time." Intent: TEMPORAL
+6. Query: "Find patients with heart disease." Intent: HYBRID
+7. Query: "Get details for patient Jane Smith." Intent: ENTITY_SPECIFIC
+8. Query: "Search for diabetes treatment options." Intent: SEMANTIC
+9. Query: "List all procedures with CPT code 99213." Intent: STRUCTURED
+10. Query: "Find patients with both asthma and allergies." Intent: HYBRID_STRUCTURED
+11. Query: "Explain the procedure for knee replacement and list patients who had it." Intent: MULTI_INTENT
+12. Query: "Look up ICD-10 code I21." Intent: KEYWORD
+13. Query: "Fetch records of patient with name Mary Johnson or number 456 or address 123 Main St." Intent: ENTITY_SPECIFIC
+14. Query: "Fetch me the details of patients with heart problems." Intent: HYBRID
+"""
 
 
 # ==============================================================================
@@ -2061,7 +2100,7 @@ def ner_preprocess(query: str) -> Optional[Dict]:
                     except Exception as e:
                         logger.warning(f"Invalid date format for {value}: {e}")
             elif label == "PERSON":
-                # Differentiate patient vs. practitioner
+                # Differentiate patient vs practitioner
                 if "doctor" in query.lower() or "dr." in query.lower():
                     must_filters.append({"match_phrase": {"practitionerName": value}})
                 else:
@@ -2120,27 +2159,35 @@ def classify_intent(query: str) -> str:
         or "retrieve file" in query_lower
     ):
         return "DOCUMENT_FETCH"
+    elif re.search(r"\bpatient\b.*\bdetails\b", query_lower) or re.search(
+        r"\bpatients?\b.*\bwith\b", query_lower
+    ):
+        return "HYBRID"  # Enhanced rule for patient detail queries
     elif re.search(r"\bpatient\b", query_lower):
         return "ENTITY_SPECIFIC"
-    else:
+
+    # Few-shot inference (Incontext Learning)
+    prompt = f"{FEW_SHOT_EXAMPLES}\nQuery: {query}\nClassification: "
+    try:
         classification = intent_classifier(
-            query, candidate_labels=INTENT_CATEGORIES, multi_label=False
+            f"{FEW_SHOT_EXAMPLES}\nQuery: {query}\nIntent: ",
+            candidate_labels=INTENT_CATEGORIES,
+            multi_label=False,
         )
-        return classification["labels"][0]
+        intent = classification["labels"][0].upper()
+        if intent not in INTENT_CATEGORIES:
+            logger.warning(f"Invalid classification '{intent}', falling back to HYBRID")
+            return "HYBRID"
+
+        return intent
+    except Exception as e:
+        logger.error(f"Intent classification error: {e}")
+        return "HYBRID"  # Safe fallback
 
 
 # ==============================================================================
 # RASS engine logic
 # ==============================================================================
-"""
-RASS engine:
-    - Classifies query intent using DistilBERT
-    - Uses appropriate search method (exact, semantic, or hybrid)
-    - Uses BlueHive for final response
-    - Saves user queries & answers in Postgres (via Prisma)
-"""
-
-
 async def ask(
     query: str,
     user_id: str,
@@ -2203,6 +2250,7 @@ async def ask(
             if patient_id and file_path:
                 if patient_id not in patient_files:
                     patient_files[patient_id] = set()
+
                 patient_files[patient_id].add((file_path, file_type))
 
         if not patient_files:
@@ -2217,8 +2265,8 @@ async def ask(
                         f"Reached MAX_FILES_PER_PATIENT ({MAX_FILES_PER_PATIENT}) for patient {patient_id}"
                     )
                     break
-                ehr_doc = await retrieve_ehr_document(file_path)
-                if ehr_doc:
+
+                if ehr_doc := await retrieve_ehr_document(file_path):
                     retrieved_docs.append(
                         {
                             "patientId": patient_id,
@@ -2232,18 +2280,7 @@ async def ask(
         if not retrieved_docs:
             return "No accessible documents found for the patient."
 
-        response = {
-            "patient_records": [
-                {
-                    "patientId": doc["patientId"],
-                    "file_path": doc["file_path"],
-                    "file_type": doc["file_type"],
-                    "content": doc["content"],
-                }
-                for doc in retrieved_docs
-            ]
-        }
-        return json.dumps(response, indent=2)
+        return json.dumps({"patient_records": retrieved_docs}, indent=2)
 
     search_methods = {
         "SEMANTIC": os_indexer.semantic_search,
@@ -2265,17 +2302,21 @@ async def ask(
         )
         return json.dumps(result, indent=2)
 
-    partial_results = search_method(
-        query_text=query,
-        query_emb=(
-            query_emb
-            if intent in ["SEMANTIC", "HYBRID", "HYBRID_STRUCTURED", "MULTI_INTENT"]
-            else None
-        ),
-        k=top_k,
-        filter_clause=filter_clause,
-        patient_id=patient_id,
-    )
+    if intent in ["SEMANTIC", "HYBRID", "HYBRID_STRUCTURED", "MULTI_INTENT"]:
+        partial_results = search_method(
+            query=query,
+            query_emb=query_emb,
+            k=top_k,
+            filter_clause=filter_clause,
+            patient_id=patient_id,
+        )
+    else:
+        partial_results = search_method(
+            query=query,
+            k=top_k,
+            filter_clause=filter_clause,
+            patient_id=patient_id,
+        )
 
     context_map = {}
     for doc_dict, _score in partial_results:
@@ -2330,16 +2371,22 @@ async def ask(
         return "[Error] No response was generated."
 
     # store new user message + AI response
-    await db.message.create(
-        data={"chatId": chat_id, "role": "user", "content": query, "createdAt": "now()"}
-    )
-    await db.message.create(
-        data={
-            "chatId": chat_id,
-            "role": "assistant",
-            "content": answer,
-            "createdAt": "now()",
-        }
+    current_time = datetime.now(timezone.utc).isoformat()
+    await db.message.create_many(
+        [
+            {
+                "chatId": chat_id,
+                "role": "user",
+                "content": query,
+                "createdAt": current_time,
+            },
+            {
+                "chatId": chat_id,
+                "role": "assistant",
+                "content": answer,
+                "createdAt": current_time,
+            },
+        ]
     )
     return answer
 
@@ -2484,8 +2531,8 @@ async def ask_websocket_endpoint(websocket: WebSocket):
 
         query_emb = await embed_query(query)
 
-        # zero-shot classify intent asynchronously
-        intent = await intent_classifier.classify_intent(query)
+        # classify intent asynchronously
+        intent = await classify_intent(query)
         print(f"[WebSocket Debug] Query Intent = {intent}")
 
         index_name = get_index_name(user_id)

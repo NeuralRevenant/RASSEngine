@@ -6,6 +6,7 @@ opensearch-py
 httpx  # async HTTP calls
 openai  # OpenAI GPT-4o API calls
 python-dotenv
+werkzeug
 asyncpg
 psycopg2
 prisma
@@ -16,7 +17,7 @@ sentence-transformers>=2.2.2
 langchain  # core LangChain lib
 langchain-community  # community extensions for LangChain
 langchain-openai  # openAI-specific LangChain integration
-spacy
+spacy==3.4.1
 # markdown support
 markdown
 beautifulsoup4
