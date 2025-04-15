@@ -1128,11 +1128,6 @@ async def store_fhir_docs_in_opensearch(
     client: OpenSearch,
     index_name: str,
 ) -> None:
-    """
-    1) Bulk index the structured docs (no embeddings).
-    2) For unstructured docs, embed them => store text + embedding.
-    This aligns with the new index structure that has one text field + embedding field.
-    """
     if not client:
         print("[store_fhir_docs_in_opensearch] No OS client.")
         return
@@ -1146,13 +1141,17 @@ async def store_fhir_docs_in_opensearch(
             "_index": index_name,
             "_id": doc["doc_id"],
             "_source": doc,
+            "_routing": doc.get("patientId"),
         }
         for doc in structured_docs
     ]
 
     if bulk_actions_struct:
-        s_success, s_errors = bulk(client, bulk_actions_struct)
-        print(f"[FHIR] Indexed {s_success} structured docs. Errors: {s_errors}")
+        try:
+            success, errors = bulk(client, bulk_actions_struct)
+            logger.info(f"Indexed {success} structured docs, errors: {errors}")
+        except Exception as e:
+            logger.error(f"Structured docs indexing error: {e}")
 
     if not unstructured_docs:
         return
@@ -1163,18 +1162,19 @@ async def store_fhir_docs_in_opensearch(
 
     # Normalize embeddings
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-    embeddings_normed = embeddings / (norms + 1e-9)
+    embeddings = embeddings / (norms + 1e-9)
 
     bulk_actions_unstruct = []
     for i, docu in enumerate(unstructured_docs):
         # store as float array - emb_vector
-        docu["embedding"] = embeddings_normed[i].tolist()
+        docu["embedding"] = embeddings[i].tolist()
         # storing docu in index using the doc_id as _id
         action_unstruct = {
             "_op_type": "index",
             "_index": index_name,
             "_id": docu["doc_id"],
             "_source": docu,
+            "_routing": docu.get("patientId"),
         }
         bulk_actions_unstruct.append(action_unstruct)
 
@@ -1188,6 +1188,69 @@ async def store_fhir_docs_in_opensearch(
         print(f"[FHIR] Indexed {u_success} unstructured docs. Errors: {u_errors}")
 
 
+async def ingest_fhir_directory(fhir_dir: str, user_id: str) -> None:
+    index_name = get_index_name(user_id)
+    await ensure_index_exists(os_client, index_name)
+    all_files = []
+    for root, _, files in os.walk(fhir_dir):
+        for f in files:
+            if f.lower().endswith(SUPPORTED_FILE_EXTENSIONS):
+                all_files.append(os.path.join(root, f))
+
+    if not all_files:
+        logger.info(f"No supported files found in {fhir_dir}")
+        return
+
+    for path in all_files:
+        valid_path = validate_file_path(path, read=True)
+        if not valid_path:
+            logger.error(f"Skipping invalid file: {path}")
+            continue
+
+        logger.info(f"Processing file: {path}")
+        try:
+            file_ext = valid_path.suffix.lower()
+            if file_ext == ".json":
+                with valid_path.open("r", encoding="utf-8") as f:
+                    bundle_json = json.load(f)
+                structured_docs, unstructured_docs = parse_fhir_bundle_with_path(
+                    bundle_json, path
+                )
+            else:
+                file_type = FILE_TYPE_MARKDOWN if file_ext == ".md" else FILE_TYPE_TEXT
+                structured_docs, unstructured_docs = parse_text_file(path, file_type)
+
+            await store_fhir_docs_in_opensearch(
+                structured_docs, unstructured_docs, os_client, index_name
+            )
+        except Exception as e:
+            logger.error(f"Error processing {path}: {e}")
+
+
+async def retrieve_ehr_document(file_path: str) -> Optional[Dict]:
+    valid_path = validate_file_path(file_path, base_dir=EMB_DIR, read=True)
+    if not valid_path:
+        logger.error(f"Cannot retrieve EHR document: {file_path}")
+        return None
+
+    try:
+        file_ext = valid_path.suffix.lower()
+        if file_ext == ".json":
+            with valid_path.open("r", encoding="utf-8") as f:
+                content = json.load(f)
+
+            return {"file_type": FILE_TYPE_JSON, "content": content}
+        else:
+            with valid_path.open("r", encoding="utf-8") as f:
+                content = f.read()
+
+            file_type = FILE_TYPE_MARKDOWN if file_ext == ".md" else FILE_TYPE_TEXT
+            return {"file_type": file_type, "content": content}
+    except Exception as e:
+        logger.error(f"Error reading EHR document {valid_path}: {e}")
+        return None
+
+
 class OpenSearchIndexer:
     """
     Index documents with embeddings into OpenSearch with a hybrid search approach
@@ -1196,83 +1259,12 @@ class OpenSearchIndexer:
     def __init__(self, client: OpenSearch, index_name: str):
         self.client = client
         self.index_name = index_name
-
-    def has_any_data(self) -> bool:
-        if not self.client:
-            return False
-        try:
-            resp = self.client.count(index=self.index_name)
-            return resp["count"] > 0
-        except Exception:
-            return False
-
-    def add_embeddings(self, embeddings: np.ndarray, docs: List[Dict[str, str]]):
-        if not self.client:
-            print(
-                "[OpenSearchIndexer - add_embeddings] No OpenSearch client available."
-            )
-            return
-
-        if embeddings.size == 0 or not docs:
-            print("[OpenSearchIndexer - add_embeddings] No embeddings or empty docs.")
-            return
-
-        if embeddings.shape[0] != len(docs):
-            print(
-                f"[OpenSearchIndexer - add_embeddings] Mismatch: embeddings={embeddings.shape[0]}, docs={len(docs)}"
-            )
-            return
-
-        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-        embeddings = embeddings / (norms + 1e-9)
-
-        actions = []
-        for i, (doc_dict, emb) in enumerate(zip(docs, embeddings)):
-            doc_id = doc_dict.get("doc_id", "")
-            unstructured_text = doc_dict.get("unstructuredText", "")
-            if not unstructured_text and "text" in doc_dict:
-                unstructured_text = doc_dict["text"]
-
-            source_body = {
-                "doc_id": doc_id,
-                "doc_type": "unstructured",
-                "unstructuredText": unstructured_text,
-                "embedding": emb.tolist(),
-            }
-            actions.append(
-                {
-                    "_op_type": "index",
-                    "_index": self.index_name,
-                    "_id": f"{doc_id}_{i}",
-                    "_source": source_body,
-                }
-            )
-            if len(actions) >= BATCH_SIZE:
-                self._bulk_index(actions)
-                actions = []
-
-        if actions:
-            self._bulk_index(actions)
-
-    def _bulk_index(self, actions):
-        try:
-            success, errors = bulk(self.client, actions)
-            print(f"[OpenSearchIndexer] Inserted {success} docs, errors={errors}")
-        except Exception as e:
-            print(f"[OpenSearchIndexer] Bulk indexing error: {e}")
-
-    def exact_match_search(
-        self, query_text: str, k: int = TOP_K
-    ) -> List[Tuple[Dict[str, str], float]]:
-        if not self.client or not query_text.strip():
-            return []
-
-        text_fields = [
-            "unstructuredText^3",  # Boost unstructured text, other fields similarly ...
+        self.text_fields = [
+            "unstructuredText^3",
             "patientName^3",
             "patientAddress^3",
             "patientTelecom^3",
-            "conditionCodeText^2",  # Boost condition text, other fields similarly ...
+            "conditionCodeText^2",
             "conditionNote^2",
             "observationCodeText",
             "observationValue",
@@ -1295,8 +1287,7 @@ class OpenSearchIndexer:
             "organizationAddress",
             "organizationTelecom",
         ]
-
-        keyword_fields = [
+        self.keyword_fields = [
             "patientGender^3",
             "patientMaritalStatus^2",
             "patientLanguage^3",
@@ -1322,92 +1313,109 @@ class OpenSearchIndexer:
             "practitionerSpecialty",
             "organizationType",
         ]
+        self.date_fields = [
+            "patientDOB",
+            "conditionOnsetDateTime",
+            "conditionRecordedDate",
+            "observationEffectiveDateTime",
+            "observationIssued",
+            "encounterStart",
+            "encounterEnd",
+            "medRequestAuthoredOn",
+            "procedurePerformedDateTime",
+            "allergyOnsetDateTime",
+        ]
 
-        # text-based subquery (only text fields)
-        text_subquery = {
-            "multi_match": {
-                "query": query_text,
-                "fields": text_fields,
-                "type": "best_fields",
-                "operator": "or",  # relaxed to find broader matches
-                "fuzziness": "AUTO",
-            }
-        }
-
-        # keyword subquery (exact matches on keyword fields)
-        keyword_subquery = {
-            "multi_match": {
-                "query": query_text,
-                "fields": keyword_fields,
-                "type": "best_fields",
-                "operator": "or",
-            }
-        }
-
-        # patient-specific filter for queries mentioning 'patients'
-        if "patient" in query_text.lower():
-            bool_query["filter"] = [{"exists": {"field": "patientId"}}]
-
-        # build the query
-        bool_query = {
-            "should": [
-                text_subquery,
-                keyword_subquery,
-            ],
-            "minimum_should_match": 1,  # At least one condition must match
-        }
-
-        query_body = {
-            "size": k,
-            "query": {
-                "bool": bool_query,
-            },
-        }
+    def has_any_data(self) -> bool:
+        if not self.client:
+            return False
 
         try:
-            resp = self.client.search(index=self.index_name, body=query_body)
+            resp = self.client.count(index=self.index_name)
+            return resp["count"] > 0
+        except Exception:
+            return False
+
+    def exact_match_search(
+        self,
+        query_text: str,
+        k: int = TOP_K,
+        filter_clause: Optional[Dict] = None,
+        patient_id: Optional[str] = None,
+    ) -> List[Tuple[Dict, float]]:
+        if not query_text.strip():
+            return []
+        bool_query = {
+            "should": [
+                {
+                    "multi_match": {
+                        "query": query_text,
+                        "fields": self.text_fields,
+                        "type": "phrase",
+                        "boost": 2.0,
+                    }
+                },
+                {
+                    "multi_match": {
+                        "query": query_text,
+                        "fields": self.keyword_fields,
+                        "type": "phrase",
+                    }
+                },
+            ],
+            "minimum_should_match": 1,
+        }
+        if filter_clause or patient_id:
+            bool_query["filter"] = []
+            if filter_clause:
+                bool_query["filter"].append(filter_clause)
+            if patient_id:
+                bool_query["filter"].append({"term": {"patientId": patient_id}})
+        query_body = {"size": k, "query": {"bool": bool_query}, "terminate_after": k}
+        try:
+            resp = self.client.search(
+                index=self.index_name, body=query_body, routing=patient_id
+            )
             return [
                 (hit["_source"], float(hit["_score"])) for hit in resp["hits"]["hits"]
             ]
         except Exception as e:
-            print(f"[OpenSearchIndexer - exact_match_search] Error: {e}")
+            logger.error(f"Exact match search error: {e}")
             return []
 
     def semantic_search(
-        self, query_emb: np.ndarray, k: int = TOP_K, filter_clause: Dict = None
-    ) -> List[Tuple[Dict[str, str], float]]:
-        if not self.client or query_emb.size == 0:
+        self,
+        query_emb: np.ndarray,
+        k: int = TOP_K,
+        filter_clause: Optional[Dict] = None,
+        patient_id: Optional[str] = None,
+    ) -> List[Tuple[Dict, float]]:
+        if query_emb.size == 0:
             return []
-
         norms = np.linalg.norm(query_emb, axis=1, keepdims=True)
-        query_emb = query_emb / (norms + 1e-9)
-        vector = query_emb[0].tolist()
-
-        if filter_clause:
-            query_body = {
-                "size": k,
-                "query": {
-                    "bool": {
-                        "must": [
-                            {"knn": {"embedding": {"vector": vector, "k": k}}},
-                            filter_clause,
-                        ]
-                    }
-                },
-            }
-        else:
-            query_body = {
-                "size": k,
-                "query": {"knn": {"embedding": {"vector": vector, "k": k}}},
-            }
-
+        vector = (query_emb / (norms + 1e-9))[0].tolist()
+        query_body = {
+            "size": k,
+            "query": {"knn": {"embedding": {"vector": vector, "k": k}}},
+            "terminate_after": k,
+        }
+        if filter_clause or patient_id:
+            bool_query = {"must": [query_body["query"]]}
+            bool_query["filter"] = []
+            if filter_clause:
+                bool_query["filter"].append(filter_clause)
+            if patient_id:
+                bool_query["filter"].append({"term": {"patientId": patient_id}})
+            query_body["query"] = {"bool": bool_query}
         try:
-            resp = self.client.search(index=self.index_name, body=query_body)
+            resp = self.client.search(
+                index=self.index_name, body=query_body, routing=patient_id
+            )
             return [
                 (hit["_source"], float(hit["_score"])) for hit in resp["hits"]["hits"]
             ]
         except Exception as e:
-            print(f"[OpenSearchIndexer - semantic_search] Error: {e}")
+            logger.error(f"Semantic search error: {e}")
             return []
 
     def hybrid_search(
@@ -1415,133 +1423,526 @@ class OpenSearchIndexer:
         query_text: str,
         query_emb: np.ndarray,
         k: int = TOP_K,
-        filter_clause: Dict = None,
-    ) -> List[Tuple[Dict[str, str], float]]:
-        if not self.client or not query_text.strip() or query_emb.size == 0:
+        filter_clause: Optional[Dict] = None,
+        patient_id: Optional[str] = None,
+    ) -> List[Tuple[Dict, float]]:
+        if not query_text.strip() or query_emb.size == 0:
             return []
-
         norms = np.linalg.norm(query_emb, axis=1, keepdims=True)
-        query_emb = query_emb / (norms + 1e-9)
-        vector = query_emb[0].tolist()
-
-        text_fields = [
-            "unstructuredText^3",  # Boost unstructured text, ....
-            "patientName^3",
-            "patientAddress^3",
-            "patientTelecom^3",
-            "conditionCodeText^2",  # Boost condition text, ...
-            "conditionNote^2",
-            "observationCodeText",
-            "observationValue",
-            "observationReferenceRange",
-            "observationNote^2",
-            "encounterType",
-            "encounterReasonCode",
-            "encounterLocation",
-            "encounterNote",
-            "medRequestMedicationDisplay",
-            "medRequestNote",
-            "procedureCodeText",
-            "procedureNote",
-            "allergyCodeText",
-            "allergyNote^2",
-            "practitionerName^3",
-            "practitionerAddress",
-            "practitionerTelecom",
-            "organizationName^3",
-            "organizationAddress",
-            "organizationTelecom",
-        ]
-
-        keyword_fields = [
-            "patientGender^3",
-            "patientMaritalStatus^2",
-            "patientLanguage^3",
-            "conditionCategory^2",
-            "conditionClinicalStatus",
-            "conditionVerificationStatus",
-            "conditionSeverity",
-            "observationUnit",
-            "observationInterpretation",
-            "encounterStatus",
-            "encounterClass",
-            "encounterServiceProvider",
-            "medRequestIntent",
-            "medRequestStatus",
-            "medRequestPriority",
-            "procedureStatus",
-            "allergyClinicalStatus",
-            "allergyVerificationStatus",
-            "allergyType",
-            "allergyCategory",
-            "allergyCriticality",
-            "practitionerGender",
-            "practitionerSpecialty",
-            "organizationType",
-        ]
-
-        knn_subquery = {"knn": {"embedding": {"vector": vector, "k": k}}}
-
-        text_subquery = {
-            "multi_match": {
-                "query": query_text,
-                "fields": text_fields,
-                "type": "best_fields",
-                "operator": "or",
-                "fuzziness": "AUTO",
-            }
-        }
-
-        keyword_subquery = {
-            "multi_match": {
-                "query": query_text,
-                "fields": keyword_fields,
-                "type": "best_fields",
-                "operator": "or",
-            }
-        }
-
+        vector = (query_emb / (norms + 1e-9))[0].tolist()
         bool_query = {
             "should": [
-                text_subquery,
-                keyword_subquery,
-                knn_subquery,
+                {
+                    "multi_match": {
+                        "query": query_text,
+                        "fields": self.text_fields,
+                        "type": "best_fields",
+                        "operator": "or",
+                        "fuzziness": "AUTO",
+                        "boost": 1.5,
+                    }
+                },
+                {
+                    "multi_match": {
+                        "query": query_text,
+                        "fields": self.keyword_fields,
+                        "type": "best_fields",
+                        "operator": "or",
+                        "boost": 1.0,
+                    }
+                },
+                {"knn": {"embedding": {"vector": vector, "k": k, "boost": 2.0}}},
             ],
             "minimum_should_match": 1,
         }
-
-        if filter_clause or "patient" in query_text.lower():
+        if filter_clause or patient_id:
             bool_query["filter"] = []
             if filter_clause:
                 bool_query["filter"].append(filter_clause)
-            if "paient" in query_text.lower():
-                bool_query["filter"].append({"exists": {"field": "patientId"}})
-
-        query_body = {
-            "size": k,
-            "query": {"bool": bool_query},
-        }
-
+            if patient_id:
+                bool_query["filter"].append({"term": {"patientId": patient_id}})
+        query_body = {"size": k, "query": {"bool": bool_query}, "terminate_after": k}
         try:
-            resp = self.client.search(index=self.index_name, body=query_body)
+            resp = self.client.search(
+                index=self.index_name, body=query_body, routing=patient_id
+            )
             return [
                 (hit["_source"], float(hit["_score"])) for hit in resp["hits"]["hits"]
             ]
         except Exception as e:
-            print(f"[OpenSearchIndexer - hybrid_search] Error: {e}")
+            logger.error(f"Hybrid search error: {e}")
+            return []
+
+    def structured_search(
+        self,
+        query_text: str,
+        k: int = TOP_K,
+        filter_clause: Optional[Dict] = None,
+        patient_id: Optional[str] = None,
+    ) -> List[Tuple[Dict, float]]:
+        if not query_text.strip():
+            return []
+        structured_fields = [
+            "patientName^3",
+            "patientGender^3",
+            "patientDOB",
+            "patientTelecom^3",
+            "conditionCodeText^2",
+            "conditionClinicalStatus",
+            "conditionSeverity",
+            "observationCodeText",
+            "observationValue",
+            "observationUnit",
+            "encounterStatus",
+            "encounterClass",
+            "medRequestMedicationDisplay",
+            "medRequestStatus",
+            "procedureCodeText",
+            "procedureStatus",
+            "allergyCodeText",
+            "allergyClinicalStatus",
+            "practitionerName^3",
+            "organizationName^3",
+        ]
+        bool_query = {
+            "must": [
+                {
+                    "multi_match": {
+                        "query": query_text,
+                        "fields": structured_fields,
+                        "type": "phrase_prefix",
+                        "operator": "and",
+                    }
+                }
+            ]
+        }
+        if filter_clause or patient_id:
+            bool_query["filter"] = []
+            if filter_clause:
+                bool_query["filter"].append(filter_clause)
+            if patient_id:
+                bool_query["filter"].append({"term": {"patientId": patient_id}})
+        bool_query["filter"].append({"term": {"doc_type": "structured"}})
+        query_body = {"size": k, "query": {"bool": bool_query}, "terminate_after": k}
+        try:
+            resp = self.client.search(
+                index=self.index_name, body=query_body, routing=patient_id
+            )
+            return [
+                (hit["_source"], float(hit["_score"])) for hit in resp["hits"]["hits"]
+            ]
+        except Exception as e:
+            logger.error(f"Structured search error: {e}")
+            return []
+
+    def hybrid_structured_search(
+        self,
+        query_text: str,
+        query_emb: np.ndarray,
+        k: int = TOP_K,
+        filter_clause: Optional[Dict] = None,
+        patient_id: Optional[str] = None,
+    ) -> List[Tuple[Dict, float]]:
+        if not query_text.strip() or query_emb.size == 0:
+            return []
+        norms = np.linalg.norm(query_emb, axis=1, keepdims=True)
+        vector = (query_emb / (norms + 1e-9))[0].tolist()
+        structured_fields = [
+            "patientName^3",
+            "patientGender^3",
+            "patientTelecom^3",
+            "conditionCodeText^2",
+            "conditionClinicalStatus",
+            "conditionSeverity",
+            "observationCodeText",
+            "observationValue",
+            "observationUnit",
+            "encounterStatus",
+            "encounterClass",
+            "medRequestMedicationDisplay",
+            "medRequestStatus",
+            "procedureCodeText",
+            "procedureStatus",
+            "allergyCodeText",
+            "allergyClinicalStatus",
+            "practitionerName^3",
+            "organizationName^3",
+        ]
+        bool_query = {
+            "should": [
+                {
+                    "multi_match": {
+                        "query": query_text,
+                        "fields": structured_fields,
+                        "type": "phrase_prefix",
+                        "operator": "and",
+                        "boost": 1.5,
+                    }
+                },
+                {"knn": {"embedding": {"vector": vector, "k": k, "boost": 2.0}}},
+            ],
+            "minimum_should_match": 1,
+        }
+        if filter_clause or patient_id:
+            bool_query["filter"] = []
+            if filter_clause:
+                bool_query["filter"].append(filter_clause)
+            if patient_id:
+                bool_query["filter"].append({"term": {"patientId": patient_id}})
+        bool_query["filter"].append({"term": {"doc_type": "structured"}})
+        query_body = {"size": k, "query": {"bool": bool_query}, "terminate_after": k}
+        try:
+            resp = self.client.search(
+                index=self.index_name, body=query_body, routing=patient_id
+            )
+            return [
+                (hit["_source"], float(hit["_score"])) for hit in resp["hits"]["hits"]
+            ]
+        except Exception as e:
+            logger.error(f"Hybrid structured search error: {e}")
             return []
 
     def aggregate_search(
-        self, query: str, filter_clause: Optional[Dict] = None
+        self,
+        query: str,
+        filter_clause: Optional[Dict] = None,
+        patient_id: Optional[str] = None,
     ) -> Dict:
         agg_body = {
             "size": 0,
-            "aggs": {"by_condition": {"terms": {"field": "conditionCodeText"}}},
+            "aggs": {
+                "by_condition": {
+                    "terms": {"field": "conditionCodeText.keyword", "size": 5}
+                },
+                "by_resource": {"terms": {"field": "resourceType.keyword", "size": 5}},
+                "by_patient": {"terms": {"field": "patientId", "size": 5}},
+            },
         }
-        if filter_clause:
-            agg_body["query"] = filter_clause
-        resp = self.client.search(index=self.index_name, body=agg_body)
-        return resp["aggregations"]
+        if filter_clause or patient_id:
+            agg_body["query"] = {"bool": {"filter": []}}
+            if filter_clause:
+                agg_body["query"]["bool"]["filter"].append(filter_clause)
+            if patient_id:
+                agg_body["query"]["bool"]["filter"].append(
+                    {"term": {"patientId": patient_id}}
+                )
+        try:
+            resp = self.client.search(
+                index=self.index_name, body=agg_body, routing=patient_id
+            )
+            return resp["aggregations"]
+        except Exception as e:
+            logger.error(f"Aggregate search error: {e}")
+            return {}
+
+    def comparison_search(
+        self,
+        query: str,
+        k: int = TOP_K,
+        filter_clause: Optional[Dict] = None,
+        patient_id: Optional[str] = None,
+    ) -> List[Tuple[Dict, float]]:
+        if not query.strip():
+            return []
+        compare_fields = [
+            "conditionCodeText^2",
+            "observationValue",
+            "observationUnit",
+            "medRequestMedicationDisplay",
+            "procedureCodeText",
+            "allergyCodeText",
+        ]
+        bool_query = {
+            "should": [
+                {
+                    "multi_match": {
+                        "query": query,
+                        "fields": compare_fields,
+                        "type": "best_fields",
+                        "operator": "or",
+                        "fuzziness": "AUTO",
+                    }
+                }
+            ],
+            "minimum_should_match": 1,
+        }
+        if filter_clause or patient_id:
+            bool_query["filter"] = []
+            if filter_clause:
+                bool_query["filter"].append(filter_clause)
+            if patient_id:
+                bool_query["filter"].append({"term": {"patientId": patient_id}})
+        query_body = {
+            "size": k,
+            "query": {"bool": bool_query},
+            "aggs": {
+                "by_field": {"terms": {"field": "conditionCodeText.keyword", "size": 3}}
+            },
+            "terminate_after": k,
+        }
+        try:
+            resp = self.client.search(
+                index=self.index_name, body=query_body, routing=patient_id
+            )
+            return [
+                (hit["_source"], float(hit["_score"])) for hit in resp["hits"]["hits"]
+            ]
+        except Exception as e:
+            logger.error(f"Comparison search error: {e}")
+            return []
+
+    def temporal_search(
+        self,
+        query: str,
+        k: int = TOP_K,
+        filter_clause: Optional[Dict] = None,
+        patient_id: Optional[str] = None,
+    ) -> List[Tuple[Dict, float]]:
+        if not query.strip():
+            return []
+        date_query = {
+            "bool": {
+                "should": [
+                    {"range": {field: {"gte": "now-1y", "lte": "now"}}}
+                    for field in self.date_fields
+                ],
+                "minimum_should_match": 1,
+            }
+        }
+        bool_query = {
+            "must": [
+                {
+                    "multi_match": {
+                        "query": query,
+                        "fields": self.text_fields + self.keyword_fields,
+                        "type": "best_fields",
+                        "operator": "or",
+                    }
+                },
+                date_query,
+            ]
+        }
+        if filter_clause or patient_id:
+            bool_query["filter"] = []
+            if filter_clause:
+                bool_query["filter"].append(filter_clause)
+            if patient_id:
+                bool_query["filter"].append({"term": {"patientId": patient_id}})
+        query_body = {
+            "size": k,
+            "query": {"bool": bool_query},
+            "sort": [{"conditionOnsetDateTime": {"order": "desc"}}],
+            "terminate_after": k,
+        }
+        try:
+            resp = self.client.search(
+                index=self.index_name, body=query_body, routing=patient_id
+            )
+            return [
+                (hit["_source"], float(hit["_score"])) for hit in resp["hits"]["hits"]
+            ]
+        except Exception as e:
+            logger.error(f"Temporal search error: {e}")
+            return []
+
+    def explanatory_search(
+        self,
+        query: str,
+        k: int = TOP_K,
+        filter_clause: Optional[Dict] = None,
+        patient_id: Optional[str] = None,
+    ) -> List[Tuple[Dict, float]]:
+        if not query.strip():
+            return []
+        note_fields = [
+            "conditionNote^3",
+            "observationNote^3",
+            "encounterNote^3",
+            "medRequestNote^3",
+            "procedureNote^3",
+            "allergyNote^3",
+            "unstructuredText^2",
+        ]
+        bool_query = {
+            "must": [
+                {
+                    "multi_match": {
+                        "query": query,
+                        "fields": note_fields,
+                        "type": "best_fields",
+                        "operator": "or",
+                        "fuzziness": "AUTO",
+                    }
+                }
+            ]
+        }
+        if filter_clause or patient_id:
+            bool_query["filter"] = []
+            if filter_clause:
+                bool_query["filter"].append(filter_clause)
+            if patient_id:
+                bool_query["filter"].append({"term": {"patientId": patient_id}})
+        query_body = {"size": k, "query": {"bool": bool_query}, "terminate_after": k}
+        try:
+            resp = self.client.search(
+                index=self.index_name, body=query_body, routing=patient_id
+            )
+            return [
+                (hit["_source"], float(hit["_score"])) for hit in resp["hits"]["hits"]
+            ]
+        except Exception as e:
+            logger.error(f"Explanatory search error: {e}")
+            return []
+
+    def multi_intent_search(
+        self,
+        query: str,
+        query_emb: np.ndarray,
+        k: int = TOP_K,
+        filter_clause: Optional[Dict] = None,
+        patient_id: Optional[str] = None,
+    ) -> List[Tuple[Dict, float]]:
+        if not query.strip() or query_emb.size == 0:
+            return []
+        norms = np.linalg.norm(query_emb, axis=1, keepdims=True)
+        vector = (query_emb / (norms + 1e-9))[0].tolist()
+        bool_query = {
+            "should": [
+                {
+                    "multi_match": {
+                        "query": query,
+                        "fields": self.text_fields,
+                        "type": "best_fields",
+                        "operator": "or",
+                        "fuzziness": "AUTO",
+                        "boost": 1.0,
+                    }
+                },
+                {
+                    "multi_match": {
+                        "query": query,
+                        "fields": self.keyword_fields,
+                        "type": "best_fields",
+                        "operator": "or",
+                        "boost": 0.5,
+                    }
+                },
+                {"knn": {"embedding": {"vector": vector, "k": k, "boost": 1.5}}},
+                {
+                    "range": {field: {"gte": "now-1y", "lte": "now", "boost": 0.5}}
+                    for field in self.date_fields
+                },
+            ],
+            "minimum_should_match": 1,
+        }
+        if filter_clause or patient_id:
+            bool_query["filter"] = []
+            if filter_clause:
+                bool_query["filter"].append(filter_clause)
+            if patient_id:
+                bool_query["filter"].append({"term": {"patientId": patient_id}})
+        query_body = {"size": k, "query": {"bool": bool_query}, "terminate_after": k}
+        try:
+            resp = self.client.search(
+                index=self.index_name, body=query_body, routing=patient_id
+            )
+            return [
+                (hit["_source"], float(hit["_score"])) for hit in resp["hits"]["hits"]
+            ]
+        except Exception as e:
+            logger.error(f"Multi-intent search error: {e}")
+            return []
+
+    def entity_specific_search(
+        self,
+        query: str,
+        k: int = TOP_K,
+        filter_clause: Optional[Dict] = None,
+        patient_id: Optional[str] = None,
+    ) -> List[Tuple[Dict, float]]:
+        if not query.strip():
+            return []
+        entity_fields = [
+            "patientName^4",
+            "patientId^4",
+            "patientGender^3",
+            "patientTelecom^3",
+            "practitionerName^3",
+            "organizationName^3",
+        ]
+        bool_query = {
+            "must": [
+                {
+                    "multi_match": {
+                        "query": query,
+                        "fields": entity_fields,
+                        "type": "phrase",
+                        "operator": "and",
+                    }
+                }
+            ]
+        }
+        if filter_clause or patient_id:
+            bool_query["filter"] = []
+            if filter_clause:
+                bool_query["filter"].append(filter_clause)
+            if patient_id:
+                bool_query["filter"].append({"term": {"patientId": patient_id}})
+        query_body = {"size": k, "query": {"bool": bool_query}, "terminate_after": k}
+        try:
+            resp = self.client.search(
+                index=self.index_name, body=query_body, routing=patient_id
+            )
+            return [
+                (hit["_source"], float(hit["_score"])) for hit in resp["hits"]["hits"]
+            ]
+        except Exception as e:
+            logger.error(f"Entity-specific search error: {e}")
+            return []
+
+    def document_fetch_search(
+        self,
+        query: str,
+        k: int = TOP_K,
+        filter_clause: Optional[Dict] = None,
+        patient_id: Optional[str] = None,
+    ) -> List[Tuple[Dict, float]]:
+        if not query.strip():
+            return []
+        bool_query = {
+            "must": [
+                {
+                    "multi_match": {
+                        "query": query,
+                        "fields": ["patientId^4", "file_path^3"],
+                        "type": "phrase",
+                    }
+                }
+            ]
+        }
+        if filter_clause or patient_id:
+            bool_query["filter"] = []
+            if filter_clause:
+                bool_query["filter"].append(filter_clause)
+            if patient_id:
+                bool_query["filter"].append({"term": {"patientId": patient_id}})
+
+        query_body = {
+            "size": k,
+            "query": {"bool": bool_query},
+            "collapse": {"field": "patientId"},
+            "terminate_after": k,
+        }
+        try:
+            resp = self.client.search(
+                index=self.index_name, body=query_body, routing=patient_id
+            )
+            return [
+                (hit["_source"], float(hit["_score"])) for hit in resp["hits"]["hits"]
+            ]
+        except Exception as e:
+            logger.error(f"Document fetch search error: {e}")
+            return []
 
 
 # ==============================================================================
@@ -1737,99 +2138,6 @@ RASS engine:
     - Uses BlueHive for final response
     - Saves user queries & answers in Postgres (via Prisma)
 """
-
-
-async def build_embeddings_from_scratch(pmc_dir: str, user_id: str) -> None:
-    index_name = get_index_name(user_id)
-    os_indexer = OpenSearchIndexer(os_client, index_name)
-    await ensure_index_exists(os_client, index_name)
-
-    if not os_indexer:
-        print(
-            "[build_embeddings_from_scratch] No OpenSearchIndexer => cannot build embeddings."
-        )
-        return
-
-    print("[build_embeddings_from_scratch] Building embeddings from scratch...")
-    all_files = [
-        os.path.join(root, f)
-        for root, _, files in os.walk(pmc_dir)
-        for f in files
-        if f.endswith(".txt") and f.startswith("PMC")
-    ]
-
-    all_docs = []
-    for path in all_files:
-        base_name = os.path.basename(path)
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                text = f.read()
-        except UnicodeDecodeError:
-            with open(path, "r", encoding="latin-1") as f:
-                text = f.read()
-
-        cleaned_text = basic_cleaning(text)
-        text_chunks = chunk_text(cleaned_text, CHUNK_SIZE)
-        all_docs.extend(
-            {"doc_id": base_name, "unstructuredText": chunk_str}
-            for chunk_str in text_chunks
-        )
-
-    if not all_docs:
-        print("[build_embeddings_from_scratch] No text found in directory. Exiting.")
-        return
-
-    print(
-        f"[build_embeddings_from_scratch] Generating embeddings for {len(all_docs)} chunks..."
-    )
-    chunk_texts = [d["unstructuredText"] for d in all_docs]
-    embs = await embed_texts_in_batches(chunk_texts, batch_size=BATCH_SIZE)
-    os_indexer.add_embeddings(embs, all_docs)
-
-
-async def ingest_fhir_directory(fhir_dir: str, user_id: str) -> None:
-    """
-    Enumerate all FHIR Json documents in fhir_dir, parse them, and store.
-    """
-    index_name = get_index_name(user_id)
-    os_indexer = OpenSearchIndexer(os_client, index_name)
-    await ensure_index_exists(os_client, index_name)
-
-    if not os_indexer:
-        print("[ingest_fhir_directory] No OS indexer => cannot ingest FHIR data.")
-        return
-
-    all_files = [
-        os.path.join(root, f)
-        for root, _, files in os.walk(fhir_dir)
-        for f in files
-        if f.endswith(".json")
-    ]
-    if not all_files:
-        print(f"[ingest_fhir_directory] No .json files found in {fhir_dir}.")
-        return
-
-    for path in all_files:
-        print(f"[ingest_fhir_directory] Processing FHIR file: {path}")
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                bundle_json = json.load(f)
-        except UnicodeDecodeError:
-            with open(path, "r", encoding="latin-1") as f:
-                bundle_json = json.load(f)
-        except Exception as e:
-            print(f"[ERROR] Failed reading {path}: {e}")
-            continue
-
-        # parse the entire FHIR bundle
-        structured_docs, unstructured_docs = parse_fhir_bundle(bundle_json)
-        # store them in OS
-        await store_fhir_docs_in_opensearch(
-            structured_docs,
-            unstructured_docs,
-            os_client,
-            index_name,
-        )
 
 
 async def ask(
