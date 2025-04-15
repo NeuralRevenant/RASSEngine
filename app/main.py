@@ -91,6 +91,7 @@ SUPPORTED_FILE_EXTENSIONS = (".json", ".md", ".txt")
 FILE_TYPE_JSON = "json"
 FILE_TYPE_MARKDOWN = "markdown"
 FILE_TYPE_TEXT = "text"
+MAX_FILES_PER_PATIENT = int(os.getenv("MAX_FILES_PER_PATIENT", 5))
 
 
 db = Prisma()  # prisma client init
@@ -2193,6 +2194,7 @@ async def ask(
         )
         if not results:
             return "No matching documents found."
+
         patient_files = {}
         for doc, score in results:
             patient_id = doc.get("patientId")
@@ -2202,8 +2204,10 @@ async def ask(
                 if patient_id not in patient_files:
                     patient_files[patient_id] = set()
                 patient_files[patient_id].add((file_path, file_type))
+
         if not patient_files:
             return "No documents with valid patient ID or file path found."
+
         retrieved_docs = []
         for patient_id, file_info in patient_files.items():
             file_count = 0
@@ -2224,8 +2228,10 @@ async def ask(
                         }
                     )
                     file_count += 1
+
         if not retrieved_docs:
             return "No accessible documents found for the patient."
+
         response = {
             "patient_records": [
                 {
@@ -2258,6 +2264,7 @@ async def ask(
             query, filter_clause=filter_clause, patient_id=patient_id
         )
         return json.dumps(result, indent=2)
+
     partial_results = search_method(
         query_text=query,
         query_emb=(
@@ -2505,7 +2512,7 @@ async def ask_websocket_endpoint(websocket: WebSocket):
                 snippet_pieces = [
                     f"{k}={v}"
                     for k, v in doc_dict.items()
-                    if v
+                    if v is not None
                     and k not in ["doc_id", "doc_type", "resourceType", "embedding"]
                 ]
                 snippet = "[Structured Resource] " + " | ".join(snippet_pieces)
