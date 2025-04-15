@@ -2162,7 +2162,10 @@ async def ask(
     #  apply NER and intent classification
     filter_clause = ner_preprocess(query)
     intent = classify_intent(query)
-    print(f"[Debug] Intent = {intent}, Filter Clause = {filter_clause}")
+    patient_id = infer_patient_id_from_filename(query) or None
+    logger.info(
+        f"Intent: {intent}, Filter Clause: {filter_clause}, Patient ID: {patient_id}"
+    )
 
     # fetch last 'MAX_CHAT_HISTORY' messages for context
     messages = await db.message.find_many(
@@ -2184,27 +2187,88 @@ async def ask(
     await ensure_index_exists(os_client, index_name)
     os_indexer = OpenSearchIndexer(os_client, index_name)
 
-    # OpenSearch Retrieval
-    if intent == "SEMANTIC":
-        partial_results = os_indexer.semantic_search(
-            query_emb, k=top_k, filter_clause=filter_clause
+    if intent == "DOCUMENT_FETCH":
+        results = os_indexer.document_fetch_search(
+            query, k=top_k, filter_clause=filter_clause, patient_id=patient_id
         )
-    elif intent == "KEYWORD":
-        partial_results = os_indexer.exact_match_search(
-            query, k=top_k, filter_clause=filter_clause
+        if not results:
+            return "No matching documents found."
+        patient_files = {}
+        for doc, score in results:
+            patient_id = doc.get("patientId")
+            file_path = doc.get("file_path")
+            file_type = doc.get("file_type", FILE_TYPE_JSON)
+            if patient_id and file_path:
+                if patient_id not in patient_files:
+                    patient_files[patient_id] = set()
+                patient_files[patient_id].add((file_path, file_type))
+        if not patient_files:
+            return "No documents with valid patient ID or file path found."
+        retrieved_docs = []
+        for patient_id, file_info in patient_files.items():
+            file_count = 0
+            for file_path, file_type in file_info:
+                if file_count >= MAX_FILES_PER_PATIENT:
+                    logger.warning(
+                        f"Reached MAX_FILES_PER_PATIENT ({MAX_FILES_PER_PATIENT}) for patient {patient_id}"
+                    )
+                    break
+                ehr_doc = await retrieve_ehr_document(file_path)
+                if ehr_doc:
+                    retrieved_docs.append(
+                        {
+                            "patientId": patient_id,
+                            "file_path": file_path,
+                            "file_type": file_type,
+                            "content": ehr_doc["content"],
+                        }
+                    )
+                    file_count += 1
+        if not retrieved_docs:
+            return "No accessible documents found for the patient."
+        response = {
+            "patient_records": [
+                {
+                    "patientId": doc["patientId"],
+                    "file_path": doc["file_path"],
+                    "file_type": doc["file_type"],
+                    "content": doc["content"],
+                }
+                for doc in retrieved_docs
+            ]
+        }
+        return json.dumps(response, indent=2)
+
+    search_methods = {
+        "SEMANTIC": os_indexer.semantic_search,
+        "KEYWORD": os_indexer.exact_match_search,
+        "HYBRID": os_indexer.hybrid_search,
+        "STRUCTURED": os_indexer.structured_search,
+        "HYBRID_STRUCTURED": os_indexer.hybrid_structured_search,
+        "AGGREGATE": os_indexer.aggregate_search,
+        "COMPARISON": os_indexer.comparison_search,
+        "TEMPORAL": os_indexer.temporal_search,
+        "EXPLANATORY": os_indexer.explanatory_search,
+        "MULTI_INTENT": os_indexer.multi_intent_search,
+        "ENTITY_SPECIFIC": os_indexer.entity_specific_search,
+    }
+    search_method = search_methods.get(intent, os_indexer.hybrid_search)
+    if intent == "AGGREGATE":
+        result = search_method(
+            query, filter_clause=filter_clause, patient_id=patient_id
         )
-    elif intent == "HYBRID":
-        partial_results = os_indexer.hybrid_search(
-            query, query_emb, k=top_k, filter_clause=filter_clause
-        )
-    elif intent == "AGGREGATE":
-        agg_result = os_indexer.aggregate_search(query, filter_clause)
-        return json.dumps(agg_result)
-    else:
-        # Fallback to hybrid for unhandled intents
-        partial_results = os_indexer.hybrid_search(
-            query, query_emb, k=top_k, filter_clause=filter_clause
-        )
+        return json.dumps(result, indent=2)
+    partial_results = search_method(
+        query_text=query,
+        query_emb=(
+            query_emb
+            if intent in ["SEMANTIC", "HYBRID", "HYBRID_STRUCTURED", "MULTI_INTENT"]
+            else None
+        ),
+        k=top_k,
+        filter_clause=filter_clause,
+        patient_id=patient_id,
+    )
 
     context_map = {}
     for doc_dict, _score in partial_results:
@@ -2219,7 +2283,8 @@ async def ask(
             snippet_pieces = [
                 f"{k}={v}"
                 for k, v in doc_dict.items()
-                if v and k not in ["doc_id", "doc_type", "resourceType", "embedding"]
+                if v is not None
+                and k not in ["doc_id", "doc_type", "resourceType", "embedding"]
             ]
             snippet = "[Structured Resource] " + " | ".join(snippet_pieces)
 
@@ -2236,7 +2301,7 @@ async def ask(
 
     # build the prompt with chat history and current query
     system_msg = (
-        "You are a helpful AI assistant chatbot. You must follow these rules:\n"
+        "You are a helpful medical AI assistant chatbot with access to FHIR-based, markdown, and plain-text EHR data. You must follow these rules and provide accurate and professional answers based on the query and context:\n"
         "1) Always cite document IDs from the context exactly as 'Document XYZ' without any file extensions like '.txt'.\n"
         "2) For every answer generated, there should be a reference or citation of the IDs of the documents from which the answer information was extracted at the end of the answer!\n"
         "3) If the context does not relate to the query, say 'I lack the context to answer your question.' For example, if the query is about gene mutations but the context is about climate change, acknowledge the mismatch and do not answer.\n"
@@ -2258,9 +2323,16 @@ async def ask(
         return "[Error] No response was generated."
 
     # store new user message + AI response
-    await db.message.create(data={"chatId": chat_id, "role": "user", "content": query})
     await db.message.create(
-        data={"chatId": chat_id, "role": "assistant", "content": answer}
+        data={"chatId": chat_id, "role": "user", "content": query, "createdAt": "now()"}
+    )
+    await db.message.create(
+        data={
+            "chatId": chat_id,
+            "role": "assistant",
+            "content": answer,
+            "createdAt": "now()",
+        }
     )
     return answer
 
