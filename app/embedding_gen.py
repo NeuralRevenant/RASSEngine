@@ -15,10 +15,23 @@ from opensearchpy import OpenSearch, RequestsHttpConnection
 from opensearchpy.helpers import bulk
 from dotenv import load_dotenv
 from prisma import Prisma
+from werkzeug.utils import secure_filename
 
 import markdown
 from bs4 import BeautifulSoup
 
+import logging
+from pathlib import Path
+import re
+from uuid import uuid4
+import tempfile
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler()],
+)
+logger = logging.getLogger(__name__)
 
 ##########################################
 # Load environment variables
@@ -36,7 +49,8 @@ CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "512"))
 EMBED_DIM = int(os.getenv("EMBED_DIM", "1024"))
 
 OPENSEARCH_INDEX_NAME = os.getenv("OPENSEARCH_INDEX_NAME", "")
-
+SHARD_COUNT = int(os.getenv("SHARD_COUNT", 1))
+REPLICA_COUNT = int(os.getenv("REPLICA_COUNT", 0))
 OPENSEARCH_HOST = os.getenv("OPENSEARCH_HOST", "localhost")
 OPENSEARCH_PORT = int(os.getenv("OPENSEARCH_PORT", "9200"))
 
@@ -46,6 +60,15 @@ POSTGRES_USER = os.getenv("POSTGRES_USER", "")
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
 POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
 
+SUPPORTED_FILE_EXTENSIONS = (".json", ".md", ".txt")
+FILE_TYPE_JSON = "json"
+FILE_TYPE_MARKDOWN = "markdown"
+FILE_TYPE_TEXT = "text"
+
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", "10485760"))  # 10 MB
+MAX_FILES_PER_REQUEST = int(os.getenv("MAX_FILES_PER_REQUEST", "5"))
+MAX_CONCURRENT_FILES = int(os.getenv("MAX_CONCURRENT_FILES", "5"))
+
 db = Prisma()
 
 
@@ -54,12 +77,11 @@ db = Prisma()
 ########################################
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("[Lifespan] Starting Embedding Service...")
-    # Handles database connection lifecycle
+    logger.info("[Lifespan] Starting Embedding Service...")
     await db.connect()
-    print("[Lifespan] Embedding Service is ready.")
+    logger.info("[Lifespan] Embedding Service is ready.")
     yield
-    print("[Lifespan] Embedding Service is shutting down...")
+    logger.info("[Lifespan] Embedding Service is shutting down...")
     await db.disconnect()
 
 
@@ -105,165 +127,10 @@ try:
         connection_class=RequestsHttpConnection,
     )
     info = os_client.info()
-    print("[INFO] Connected to OpenSearch:", info["version"])
+    logger.info(f"Connected to OpenSearch: {info['version']}")
 except Exception as e:
-    print("[ERROR] Could not connect to OpenSearch:", e)
+    logger.error(f"Could not connect to OpenSearch: {e}")
     os_client = None
-
-
-#############################################################
-# Create user-specific index
-############################################################
-def init_user_index(user_id: str):
-    if not os_client:
-        print("[WARNING] No OpenSearch client => cannot init user index.")
-        return
-
-    index_name = f"{OPENSEARCH_INDEX_NAME}-{user_id}"
-    if os_client.indices.exists(index_name):
-        print(f"[INFO] Index already exists: {index_name}")
-        return
-
-    mapping_body = {
-        "settings": {"index": {"knn": True}},
-        "mappings": {
-            "properties": {
-                "doc_id": {"type": "keyword"},
-                "doc_type": {"type": "keyword"},
-                "resourceType": {"type": "keyword"},
-                "patientId": {"type": "keyword"},
-                "patientName": {"type": "text"},
-                "patientGender": {"type": "keyword"},
-                "patientDOB": {
-                    "type": "date",
-                    "format": "yyyy-MM-dd||strict_date_optional_time||epoch_millis",
-                },
-                "patientAddress": {"type": "text"},
-                "patientMaritalStatus": {"type": "keyword"},
-                "patientMultipleBirth": {"type": "integer"},
-                "patientTelecom": {"type": "text"},
-                "patientLanguage": {"type": "keyword"},
-                "conditionId": {"type": "keyword"},
-                "conditionCodeText": {"type": "text"},
-                "conditionCategory": {"type": "keyword"},
-                "conditionClinicalStatus": {"type": "keyword"},
-                "conditionVerificationStatus": {"type": "keyword"},
-                "conditionOnsetDateTime": {
-                    "type": "date",
-                    "format": "date_time||strict_date_optional_time||epoch_millis",
-                },
-                "conditionRecordedDate": {
-                    "type": "date",
-                    "format": "date_time||strict_date_optional_time||epoch_millis",
-                },
-                "conditionSeverity": {"type": "keyword"},
-                "conditionNote": {"type": "text"},
-                "observationId": {"type": "keyword"},
-                "observationCodeText": {"type": "text"},
-                "observationValue": {"type": "text"},
-                "observationUnit": {"type": "keyword"},
-                "observationInterpretation": {"type": "keyword"},
-                "observationEffectiveDateTime": {
-                    "type": "date",
-                    "format": "date_time||strict_date_optional_time||epoch_millis",
-                },
-                "observationIssued": {
-                    "type": "date",
-                    "format": "date_time||strict_date_optional_time||epoch_millis",
-                },
-                "observationReferenceRange": {"type": "text"},
-                "observationNote": {"type": "text"},
-                "encounterId": {"type": "keyword"},
-                "encounterStatus": {"type": "keyword"},
-                "encounterClass": {"type": "keyword"},
-                "encounterType": {"type": "text"},
-                "encounterReasonCode": {"type": "text"},
-                "encounterStart": {
-                    "type": "date",
-                    "format": "date_time||strict_date_optional_time||epoch_millis",
-                },
-                "encounterEnd": {
-                    "type": "date",
-                    "format": "date_time||strict_date_optional_time||epoch_millis",
-                },
-                "encounterLocation": {"type": "text"},
-                "encounterServiceProvider": {"type": "keyword"},
-                "encounterParticipant": {"type": "text"},
-                "encounterNote": {"type": "text"},
-                "medRequestId": {"type": "keyword"},
-                "medRequestMedicationDisplay": {"type": "text"},
-                "medRequestAuthoredOn": {
-                    "type": "date",
-                    "format": "date_time||strict_date_optional_time||epoch_millis",
-                },
-                "medRequestIntent": {"type": "keyword"},
-                "medRequestStatus": {"type": "keyword"},
-                "medRequestPriority": {"type": "keyword"},
-                "medRequestDosageInstruction": {"type": "text"},
-                "medRequestDispenseRequest": {"type": "text"},
-                "medRequestNote": {"type": "text"},
-                "procedureId": {"type": "keyword"},
-                "procedureCodeText": {"type": "text"},
-                "procedureStatus": {"type": "keyword"},
-                "procedurePerformedDateTime": {
-                    "type": "date",
-                    "format": "date_time||strict_date_optional_time||epoch_millis",
-                },
-                "procedureFollowUp": {"type": "text"},
-                "procedureNote": {"type": "text"},
-                "allergyId": {"type": "keyword"},
-                "allergyClinicalStatus": {"type": "keyword"},
-                "allergyVerificationStatus": {"type": "keyword"},
-                "allergyType": {"type": "keyword"},
-                "allergyCategory": {"type": "keyword"},
-                "allergyCriticality": {"type": "keyword"},
-                "allergyCodeText": {"type": "text"},
-                "allergyOnsetDateTime": {
-                    "type": "date",
-                    "format": "date_time||strict_date_optional_time||epoch_millis",
-                },
-                "allergyNote": {"type": "text"},
-                "practitionerId": {"type": "keyword"},
-                "practitionerName": {"type": "text"},
-                "practitionerGender": {"type": "keyword"},
-                "practitionerSpecialty": {"type": "keyword"},
-                "practitionerAddress": {"type": "text"},
-                "practitionerTelecom": {"type": "text"},
-                "organizationId": {"type": "keyword"},
-                "organizationName": {"type": "text"},
-                "organizationType": {"type": "keyword"},
-                "organizationAddress": {"type": "text"},
-                "organizationTelecom": {"type": "text"},
-                "unstructuredText": {"type": "text"},
-                "embedding": {
-                    "type": "knn_vector",
-                    "dimension": EMBED_DIM,
-                    "method": {
-                        "name": "hnsw",
-                        "engine": "nmslib",
-                        "space_type": "cosinesimil",
-                        "parameters": {"m": 48, "ef_construction": 400},
-                    },
-                },
-            }
-        },
-    }
-    try:
-        os_client.indices.create(index=index_name, body=mapping_body)
-        print(f"[INFO] Created user-specific index: {index_name}")
-    except Exception as exc:
-        print(f"[ERROR] Could not create index {index_name}: {exc}")
-
-
-###############################################################################
-# PostgreSQL DB Async Connection
-###############################################################################
-async def check_user_authorized(user_id: str) -> bool:
-    user = await db.user.find_unique(where={"id": user_id})
-    if user:
-        return True
-
-    return False
 
 
 ###############################################################################
@@ -275,6 +142,7 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
     for i in range(0, len(words), chunk_size):
         chunk_str = " ".join(words[i : i + chunk_size])
         chunks.append(chunk_str.strip())
+
     return chunks
 
 
@@ -324,116 +192,245 @@ async def embed_texts_in_batches(texts: List[str]) -> np.ndarray:
     return arr
 
 
-################################################################
-# Bulk indexing unstructured chunks
-##########################################################
-def bulk_index_unstructured(
-    user_id: str,
-    doc_id: str,
-    text_chunks: List[str],
-    embeddings: np.ndarray,
-    resourceType: Optional[str] = None,
-):
-    if not os_client:
-        print("[ERROR] No OpenSearch => cannot index unstructured docs.")
-        return
+def get_index_name(user_id: str) -> str:
+    return f"{OPENSEARCH_INDEX_NAME}-{user_id}"
 
-    index_name = f"{OPENSEARCH_INDEX_NAME}-{user_id}"
-    init_user_index(user_id)
 
-    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-    embeddings = embeddings / (norms + 1e-9)
-
-    actions = []
-    for i, chunk in enumerate(text_chunks):
-        chunk_vec = embeddings[i].tolist()
-        chunk_id = f"{doc_id}_chunk_{i}"
-        body_doc = {
-            "doc_id": doc_id,
-            "doc_type": "unstructured",
-            "unstructuredText": chunk,
-            "embedding": chunk_vec,
-        }
-        if resourceType:
-            body_doc["resourceType"] = resourceType
-
-        actions.append(
-            {
-                "_op_type": "index",
-                "_index": index_name,
-                "_id": chunk_id,
-                "_source": body_doc,
+async def ensure_index_exists(client: OpenSearch, index_name: str):
+    try:
+        if not client.indices.exists(index_name):
+            index_body = {
+                "settings": {
+                    "index": {
+                        "knn": True,
+                        "number_of_shards": SHARD_COUNT,
+                        "number_of_replicas": REPLICA_COUNT,
+                    }
+                },  # for vector search
+                "mappings": {
+                    "properties": {
+                        # ----------------------------------------------------------------
+                        # Core Identifiers & Document Typing
+                        # ----------------------------------------------------------------
+                        "doc_id": {"type": "keyword"},
+                        "doc_type": {"type": "keyword"},
+                        "resourceType": {"type": "keyword"},
+                        "file_path": {"type": "keyword"},
+                        "file_type": {"type": "keyword"},  # json, markdown, text
+                        # ----------------------------------------------------------------
+                        # FHIR "Patient" resource fields
+                        # ----------------------------------------------------------------
+                        "patientId": {"type": "keyword"},
+                        "patientName": {
+                            "type": "text",
+                            "fields": {
+                                "keyword": {"type": "keyword", "ignore_above": 256}
+                            },
+                        },
+                        "patientGender": {"type": "keyword"},
+                        "patientDOB": {
+                            "type": "date",
+                            "format": "yyyy-MM-dd||strict_date_optional_time||epoch_millis",
+                        },
+                        "patientAddress": {
+                            "type": "text",
+                            "fields": {
+                                "keyword": {"type": "keyword", "ignore_above": 256}
+                            },
+                        },
+                        "patientMaritalStatus": {"type": "keyword"},
+                        "patientMultipleBirth": {"type": "integer"},
+                        "patientTelecom": {
+                            "type": "text",
+                            "fields": {
+                                "keyword": {"type": "keyword", "ignore_above": 256}
+                            },
+                        },
+                        "patientLanguage": {"type": "keyword"},
+                        # ----------------------------------------------------------------
+                        # FHIR "Condition" resource fields
+                        # ----------------------------------------------------------------
+                        "conditionId": {"type": "keyword"},
+                        "conditionCodeText": {
+                            "type": "text",
+                            "fields": {
+                                "keyword": {"type": "keyword", "ignore_above": 256}
+                            },
+                        },
+                        "conditionCategory": {"type": "keyword"},
+                        "conditionClinicalStatus": {"type": "keyword"},
+                        "conditionVerificationStatus": {"type": "keyword"},
+                        "conditionOnsetDateTime": {
+                            "type": "date",
+                            "format": "date_time||strict_date_optional_time||epoch_millis",
+                        },
+                        "conditionRecordedDate": {
+                            "type": "date",
+                            "format": "date_time||strict_date_optional_time||epoch_millis",
+                        },
+                        "conditionSeverity": {"type": "keyword"},
+                        "conditionNote": {"type": "text"},
+                        # ----------------------------------------------------------------
+                        # FHIR "Observation" resource fields
+                        # ----------------------------------------------------------------
+                        "observationId": {"type": "keyword"},
+                        "observationCodeText": {
+                            "type": "text",
+                            "fields": {
+                                "keyword": {"type": "keyword", "ignore_above": 256}
+                            },
+                        },
+                        "observationValue": {
+                            "type": "text",
+                            "fields": {
+                                "keyword": {"type": "keyword", "ignore_above": 256}
+                            },
+                        },
+                        "observationUnit": {"type": "keyword"},
+                        "observationInterpretation": {"type": "keyword"},
+                        "observationEffectiveDateTime": {
+                            "type": "date",
+                            "format": "date_time||strict_date_optional_time||epoch_millis",
+                        },
+                        "observationIssued": {
+                            "type": "date",
+                            "format": "date_time||strict_date_optional_time||epoch_millis",
+                        },
+                        "observationReferenceRange": {"type": "text"},
+                        "observationNote": {"type": "text"},
+                        # ----------------------------------------------------------------
+                        # FHIR "Encounter" resource fields
+                        # ----------------------------------------------------------------
+                        "encounterId": {"type": "keyword"},
+                        "encounterStatus": {"type": "keyword"},
+                        "encounterClass": {"type": "keyword"},
+                        "encounterType": {"type": "text"},
+                        "encounterReasonCode": {"type": "text"},
+                        "encounterStart": {
+                            "type": "date",
+                            "format": "date_time||strict_date_optional_time||epoch_millis",
+                        },
+                        "encounterEnd": {
+                            "type": "date",
+                            "format": "date_time||strict_date_optional_time||epoch_millis",
+                        },
+                        "encounterLocation": {"type": "text"},
+                        "encounterServiceProvider": {"type": "keyword"},
+                        "encounterParticipant": {"type": "text"},
+                        "encounterNote": {"type": "text"},
+                        # ----------------------------------------------------------------
+                        # FHIR "MedicationRequest" resource fields
+                        # ----------------------------------------------------------------
+                        "medRequestId": {"type": "keyword"},
+                        "medRequestMedicationDisplay": {
+                            "type": "text",
+                            "fields": {
+                                "keyword": {"type": "keyword", "ignore_above": 256}
+                            },
+                        },
+                        "medRequestAuthoredOn": {
+                            "type": "date",
+                            "format": "date_time||strict_date_optional_time||epoch_millis",
+                        },
+                        "medRequestIntent": {"type": "keyword"},
+                        "medRequestStatus": {"type": "keyword"},
+                        "medRequestPriority": {"type": "keyword"},
+                        "medRequestDosageInstruction": {"type": "text"},
+                        "medRequestDispenseRequest": {"type": "text"},
+                        "medRequestNote": {"type": "text"},
+                        # ----------------------------------------------------------------
+                        # FHIR "Procedure" resource fields
+                        # ----------------------------------------------------------------
+                        "procedureId": {"type": "keyword"},
+                        "procedureCodeText": {
+                            "type": "text",
+                            "fields": {
+                                "keyword": {"type": "keyword", "ignore_above": 256}
+                            },
+                        },
+                        "procedureStatus": {"type": "keyword"},
+                        "procedurePerformedDateTime": {
+                            "type": "date",
+                            "format": "date_time||strict_date_optional_time||epoch_millis",
+                        },
+                        "procedureFollowUp": {"type": "text"},
+                        "procedureNote": {"type": "text"},
+                        # ----------------------------------------------------------------
+                        # FHIR "AllergyIntolerance" resource fields
+                        # ----------------------------------------------------------------
+                        "allergyId": {"type": "keyword"},
+                        "allergyClinicalStatus": {"type": "keyword"},
+                        "allergyVerificationStatus": {"type": "keyword"},
+                        "allergyType": {"type": "keyword"},
+                        "allergyCategory": {"type": "keyword"},
+                        "allergyCriticality": {"type": "keyword"},
+                        "allergyCodeText": {
+                            "type": "text",
+                            "fields": {
+                                "keyword": {"type": "keyword", "ignore_above": 256}
+                            },
+                        },
+                        "allergyOnsetDateTime": {
+                            "type": "date",
+                            "format": "date_time||strict_date_optional_time||epoch_millis",
+                        },
+                        "allergyNote": {"type": "text"},
+                        # ----------------------------------------------------------------
+                        # FHIR "Practitioner" resource fields
+                        # ----------------------------------------------------------------
+                        "practitionerId": {"type": "keyword"},
+                        "practitionerName": {
+                            "type": "text",
+                            "fields": {
+                                "keyword": {"type": "keyword", "ignore_above": 256}
+                            },
+                        },
+                        "practitionerGender": {"type": "keyword"},
+                        "practitionerSpecialty": {"type": "keyword"},
+                        "practitionerAddress": {"type": "text"},
+                        "practitionerTelecom": {"type": "text"},
+                        # ----------------------------------------------------------------
+                        # FHIR "Organization" resource fields
+                        # ----------------------------------------------------------------
+                        "organizationId": {"type": "keyword"},
+                        "organizationName": {
+                            "type": "text",
+                            "fields": {
+                                "keyword": {"type": "keyword", "ignore_above": 256}
+                            },
+                        },
+                        "organizationType": {"type": "keyword"},
+                        "organizationAddress": {"type": "text"},
+                        "organizationTelecom": {"type": "text"},
+                        # ----------------------------------------------------------------
+                        # Additional unstructured text from FHIR (like resource.text.div, resource.note[].text, etc.)
+                        # ----------------------------------------------------------------
+                        "unstructuredText": {"type": "text"},
+                        # ----------------------------------------------------------------
+                        # Vector embedding field for semantic / k-NN search
+                        # ----------------------------------------------------------------
+                        "embedding": {
+                            "type": "knn_vector",
+                            "dimension": EMBED_DIM,
+                            "method": {
+                                "name": "hnsw",
+                                "engine": "nmslib",
+                                "space_type": "cosinesimil",
+                                "parameters": {"m": 48, "ef_construction": 400},
+                            },
+                        },
+                    }
+                },
             }
-        )
-
-        if len(actions) >= BATCH_SIZE:
-            try:
-                success, errors = bulk(os_client, actions)
-                if errors:
-                    print(
-                        "[OpenSearch] partial errors on unstructured indexing:", errors
-                    )
-            except Exception as e:
-                print("[OpenSearch] bulk error unstructured:", e)
-
-            actions = []
-
-    if actions:
-        try:
-            success, errors = bulk(os_client, actions)
-            if errors:
-                print("[OpenSearch] partial errors on unstructured indexing:", errors)
-        except Exception as e:
-            print("[OpenSearch] bulk error unstructured:", e)
+            client.indices.create(index=index_name, body=index_body)
+            print(f"[INFO] Created index '{index_name}' in OpenSearch.")
+    except Exception as e:
+        print(f"[Error] OpenSearch Index could not be created: {e}")
 
 
-###############################################################################
-# Bulk indexing structured docs
-###############################################################################
-def bulk_index_structured(user_id: str, doc_id: str, structured_docs: List[Dict]):
-    if not os_client:
-        print("[ERROR] No OpenSearch => cannot index structured docs.")
-        return
-
-    index_name = f"{OPENSEARCH_INDEX_NAME}-{user_id}"
-    init_user_index(user_id)
-
-    actions = []
-    for i, sdoc in enumerate(structured_docs):
-        if "doc_type" not in sdoc:
-            sdoc["doc_type"] = "structured"
-
-        final_id = sdoc.get("doc_id", f"{doc_id}_structured_{i}")
-        actions.append(
-            {
-                "_op_type": "index",
-                "_index": index_name,
-                "_id": final_id,
-                "_source": sdoc,
-            }
-        )
-
-        if len(actions) >= BATCH_SIZE:
-            try:
-                success, errors = bulk(os_client, actions)
-                if errors:
-                    print("[OpenSearch] partial errors on structured indexing:", errors)
-            except Exception as ex:
-                print("[OpenSearch] bulk error structured:", ex)
-            actions = []
-
-    if actions:
-        try:
-            success, errors = bulk(os_client, actions)
-            if errors:
-                print("[OpenSearch] partial errors on structured indexing:", errors)
-        except Exception as ex:
-            print("[OpenSearch] bulk error structured:", ex)
-
-
-################################################
-# FHIR Parser
-################################################
+# ========================================================
+# Parsing FHIR Bundle
+# ====================================================
 def extract_code_text(field) -> str:
     if isinstance(field, dict):
         return field.get("text") or field.get("coding", [{}])[0].get("code", "")
@@ -472,6 +469,8 @@ def parse_fhir_bundle(bundle_json: Dict) -> Tuple[List[Dict], List[Dict]]:
             "doc_id": f"{rtype}-{rid}-structured",
             "doc_type": "structured",
             "resourceType": rtype,
+            "file_path": None,
+            "file_type": FILE_TYPE_JSON,
             # Patient
             "patientId": None,
             "patientName": None,
@@ -554,8 +553,7 @@ def parse_fhir_bundle(bundle_json: Dict) -> Tuple[List[Dict], List[Dict]]:
             "organizationType": None,
             "organizationAddress": None,
             "organizationTelecom": None,
-            # We do not store embeddings in structured docs
-            # unstructured docs will have "embedding" once we embed them
+            # We don't store embeddings in structured docs - unstructured docs will have "embedding" once embedded
         }
 
         # gather unstructured text from various narrative or note fields
@@ -953,6 +951,8 @@ def parse_fhir_bundle(bundle_json: Dict) -> Tuple[List[Dict], List[Dict]]:
                 if otele_arr:
                     sdoc["organizationTelecom"] = " | ".join(otele_arr)
 
+        # ... if needed in the future more resource types can be added ...
+
         # add the structured doc
         structured_docs.append(sdoc)
 
@@ -966,139 +966,446 @@ def parse_fhir_bundle(bundle_json: Dict) -> Tuple[List[Dict], List[Dict]]:
             # chunk long text
             text_chunks = chunk_text(combined_text, chunk_size=CHUNK_SIZE)
             for c_i, chunk_str in enumerate(text_chunks):
-                unstructured_docs.append(
-                    {
-                        "doc_id": f"{rtype}-{rid}-unstructured-{c_i}",
-                        "doc_type": "unstructured",
-                        "resourceType": rtype,
-                        # storing the text in 'unstructuredText' field
-                        "unstructuredText": chunk_str,
-                    }
-                )
+                udoc = {
+                    "doc_id": f"{rtype}-{rid}-unstructured-{c_i}",
+                    "doc_type": "unstructured",
+                    "resourceType": rtype,
+                    "file_path": None,
+                    "file_type": FILE_TYPE_JSON,
+                    "patientId": sdoc["patientId"],
+                    # storing the text in 'unstructuredText' field
+                    "unstructuredText": chunk_str,
+                }
+                unstructured_docs.append(udoc)
 
     return (structured_docs, unstructured_docs)
 
 
+def parse_fhir_bundle_with_path(
+    bundle_json: Dict, file_path: str
+) -> Tuple[List[Dict], List[Dict]]:
+    structured_docs, unstructured_docs = parse_fhir_bundle(bundle_json)
+    file_upload_dir = Path(UPLOAD_DIR).resolve()
+    absolute_path = Path(file_path).resolve()
+    try:
+        relative_file_path = str(absolute_path.relative_to(file_upload_dir))
+    except ValueError:
+        logger.warning(
+            f"File {file_path} is not under FILE_DIR {file_upload_dir}, using absolute path"
+        )
+        relative_file_path = str(absolute_path)
+
+    for doc in structured_docs:
+        doc["file_path"] = relative_file_path
+
+    for doc in unstructured_docs:
+        doc["file_path"] = relative_file_path
+
+    return structured_docs, unstructured_docs
+
+
+def infer_patient_id_from_filename(filename: str) -> Optional[str]:
+    """
+    Infer patientId from filename, e.g., 'patient_123_notes.md' -> '123'.
+    Returns None if no patientId is found.
+    """
+    match = re.search(r"patient_(\d+)", filename, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def parse_text_file(file_path: str, file_type: str) -> Tuple[List[Dict], List[Dict]]:
+    structured_docs = []
+    unstructured_docs = []
+    emb_dir = Path(UPLOAD_DIR).resolve()
+    absolute_path = Path(file_path).resolve()
+    try:
+        relative_file_path = str(absolute_path.relative_to(emb_dir))
+    except ValueError:
+        logger.warning(
+            f"File {file_path} is not under EMB_DIR {emb_dir}, using absolute path"
+        )
+        relative_file_path = str(absolute_path)
+
+    patient_id = infer_patient_id_from_filename(absolute_path.name)
+    try:
+        with absolute_path.open("r", encoding="utf-8") as f:
+            content = f.read().strip()
+    except UnicodeDecodeError:
+        with absolute_path.open("r", encoding="latin-1") as f:
+            content = f.read().strip()
+    except Exception as e:
+        logger.error(f"Failed to read text file {file_path}: {e}")
+        return structured_docs, unstructured_docs
+    if not content:
+        logger.warning(f"Empty text file: {file_path}")
+        return structured_docs, unstructured_docs
+
+    text_chunks = chunk_text(content, chunk_size=CHUNK_SIZE)
+    for i, chunk in enumerate(text_chunks):
+        doc_id = f"{file_type}-{absolute_path.stem}-{i}"
+        unstructured_docs.append(
+            {
+                "doc_id": doc_id,
+                "doc_type": "unstructured",
+                "resourceType": file_type,
+                "file_path": relative_file_path,
+                "file_type": file_type,
+                "patientId": patient_id,
+                "unstructuredText": chunk,
+            }
+        )
+
+    return structured_docs, unstructured_docs
+
+
+async def store_fhir_docs_in_opensearch(
+    structured_docs: List[Dict],
+    unstructured_docs: List[Dict],
+    client: OpenSearch,
+    index_name: str,
+) -> None:
+    if not client:
+        print("[store_fhir_docs_in_opensearch] No OS client.")
+        return
+
+    await ensure_index_exists(client, index_name)
+
+    # Bulk index structured docs
+    bulk_actions_struct = [
+        {
+            "_op_type": "index",
+            "_index": index_name,
+            "_id": doc["doc_id"],
+            "_source": doc,
+            "_routing": doc.get("patientId"),
+        }
+        for doc in structured_docs
+    ]
+
+    if bulk_actions_struct:
+        try:
+            success, errors = bulk(client, bulk_actions_struct)
+            logger.info(f"Indexed {success} structured docs, errors: {errors}")
+        except Exception as e:
+            logger.error(f"Structured docs indexing error: {e}")
+
+    if not unstructured_docs:
+        return
+
+    # embed the unstructured text, then store each doc with "unstructuredText" plus the "embedding" field.
+    un_texts = [d["unstructuredText"] for d in unstructured_docs]
+    embeddings = await embed_texts_in_batches(un_texts)
+
+    # Normalize embeddings
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    embeddings = embeddings / (norms + 1e-9)
+
+    bulk_actions_unstruct = []
+    for i, docu in enumerate(unstructured_docs):
+        # store as float array - emb_vector
+        docu["embedding"] = embeddings[i].tolist()
+        # storing docu in index using the doc_id as _id
+        action_unstruct = {
+            "_op_type": "index",
+            "_index": index_name,
+            "_id": docu["doc_id"],
+            "_source": docu,
+            "_routing": docu.get("patientId"),
+        }
+        bulk_actions_unstruct.append(action_unstruct)
+
+        if len(bulk_actions_unstruct) >= BATCH_SIZE:
+            try:
+                u_success, u_errors = bulk(client, bulk_actions_unstruct)
+                logger.info(
+                    f"Indexed {u_success} unstructured docs, errors: {u_errors}"
+                )
+                bulk_actions_unstruct = []
+            except Exception as e:
+                logger.error(f"Unstructured docs indexing error: {e}")
+
+    if bulk_actions_unstruct:
+        try:
+            u_success, u_errors = bulk(client, bulk_actions_unstruct)
+            logger.info(f"Indexed {u_success} unstructured docs, errors: {u_errors}")
+        except Exception as e:
+            logger.error(f"Unstructured docs indexing error: {e}")
+
+
+def validate_file_path(
+    file_path: str, base_dir: str = None, read: bool = False
+) -> Optional[Path]:
+    """
+    Validate a file path. If base_dir is provided, treat file_path as relative.
+    If read=True, check readability.
+    Accepts .json, .md, .txt files.
+    Returns Path object if valid, None otherwise.
+    """
+    try:
+        if base_dir:
+            path = Path(base_dir) / file_path
+        else:
+            path = Path(file_path)
+
+        path = path.resolve()
+        if not path.exists():
+            logger.error(f"File does not exist: {path}")
+            return None
+
+        if not path.is_file():
+            logger.error(f"Path is not a file: {path}")
+            return None
+
+        if path.suffix.lower() not in SUPPORTED_FILE_EXTENSIONS:
+            logger.error(f"Unsupported file extension: {path}")
+            return None
+
+        if read:
+            with path.open("r", encoding="utf-8") as f:
+                content = f.read()
+                if not content.strip():
+                    logger.error(f"File is empty: {path}")
+                    return None
+
+        return path
+    except PermissionError:
+        logger.error(f"Permission denied for file: {path}")
+        return None
+    except UnicodeDecodeError:
+        logger.error(f"File is not valid UTF-8: {path}")
+        return None
+    except Exception as e:
+        logger.error(f"Invalid file path {path}: {e}")
+        return None
+
+
+async def ingest_fhir_directory(fhir_dir: str, user_id: str) -> None:
+    index_name = get_index_name(user_id)
+    await ensure_index_exists(os_client, index_name)
+    all_files = []
+    for root, _, files in os.walk(fhir_dir):
+        for f in files:
+            if f.lower().endswith(SUPPORTED_FILE_EXTENSIONS):
+                all_files.append(os.path.join(root, f))
+
+    if not all_files:
+        logger.info(f"No supported files found in {fhir_dir}")
+        return
+
+    for path in all_files:
+        valid_path = validate_file_path(path, read=True)
+        if not valid_path:
+            logger.error(f"Skipping invalid file: {path}")
+            continue
+
+        logger.info(f"Processing file: {path}")
+        try:
+            file_ext = valid_path.suffix.lower()
+            if file_ext == ".json":
+                with valid_path.open("r", encoding="utf-8") as f:
+                    bundle_json = json.load(f)
+
+                structured_docs, unstructured_docs = parse_fhir_bundle_with_path(
+                    bundle_json, path
+                )
+            else:
+                file_type = FILE_TYPE_MARKDOWN if file_ext == ".md" else FILE_TYPE_TEXT
+                structured_docs, unstructured_docs = parse_text_file(path, file_type)
+
+            await store_fhir_docs_in_opensearch(
+                structured_docs, unstructured_docs, os_client, index_name
+            )
+        except Exception as e:
+            logger.error(f"Error processing {path}: {e}")
+
+
+###############################################################################
+# PostgreSQL DB Async Connection
+###############################################################################
+async def check_user_authorized(user_id: str) -> bool:
+    user = await db.user.find_unique(where={"id": user_id})
+    return bool(user)
+
+
+###############################################################################
+# Validation Helpers
+###############################################################################
+def validate_user_id(user_id: str) -> bool:
+    """Validate user ID: alphanumeric or UUID."""
+    pattern = r"^[a-zA-Z0-9_-]{1,36}$|^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    return bool(re.match(pattern, user_id))
+
+
+async def read_file_content(file: UploadFile, max_size: int) -> bytes:
+    """Read file content with size limit."""
+    content = bytearray()
+    while chunk := await file.read(8192):  # 8KB chunks
+        content.extend(chunk)
+        if len(content) > max_size:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File {file.filename} exceeds size limit of {max_size} bytes",
+            )
+
+    return bytes(content)
+
+
 ###############################################################
-# Endpoint: upload data => handle text (or) Json/FHIR
+# Endpoint: upload data => handle EHR data
 #############################################################
 @app.post("/upload_data")
 async def upload_data(user_id: str = Form(...), files: List[UploadFile] = File(...)):
+    """
+    Endpoint to upload and index files (txt, md, json/FHIR) for RAG/RASS engine.
+    Parses files into structured and unstructured documents, embeds and stores unstructured text.
+    """
+    if not validate_user_id(user_id):
+        logger.warning(f"Invalid user ID format: {user_id}")
+        raise HTTPException(status_code=400, detail="Invalid user ID format")
+
     authorized = await check_user_authorized(user_id)
     if not authorized:
+        logger.warning(f"Unauthorized access attempt by user: {user_id}")
+        raise HTTPException(status_code=403, detail="User not authorized")
+
+    # Validate file count
+    if not files:
+        raise HTTPException(status_code=400, detail="No files uploaded")
+
+    if len(files) > MAX_FILES_PER_REQUEST:
+        logger.warning(
+            f"Too many files uploaded: {len(files)} > {MAX_FILES_PER_REQUEST}"
+        )
         raise HTTPException(
-            status_code=403, detail=f"User '{user_id}' not authorized in Postgres."
+            status_code=400,
+            detail=f"Too many files uploaded (max {MAX_FILES_PER_REQUEST})",
         )
 
-    if not files:
-        raise HTTPException(status_code=400, detail="No files uploaded.")
-
-    user_folder = os.path.join(UPLOAD_DIR, user_id)
+    # Prepare user folder
+    user_folder = os.path.join(UPLOAD_DIR, secure_filename(user_id))
     os.makedirs(user_folder, exist_ok=True)
+    index_name = get_index_name(user_id)
+    await ensure_index_exists(os_client, index_name)
 
-    for upl_file in files:
-        extension = pathlib.Path(upl_file.filename).suffix.lower()
-        name_stem = pathlib.Path(upl_file.filename).stem
-        now_ts = int(time.time())
-        doc_id = f"{name_stem}_{now_ts}"
-        final_filename = f"{doc_id}{extension}"
-        final_path = os.path.join(user_folder, final_filename)
+    processed_files = 0
+    concurrency_sem = asyncio.Semaphore(MAX_CONCURRENT_FILES)
 
-        try:
-            with open(final_path, "wb") as bf:
-                shutil.copyfileobj(upl_file.file, bf)
-        except Exception as ex:
-            raise HTTPException(status_code=500, detail=f"File save error: {ex}")
+    async def process_file(file: UploadFile) -> Tuple[int, List[Dict], List[Dict]]:
+        async with concurrency_sem:
+            # Sanitize filename
+            filename = secure_filename(file.filename)
+            extension = pathlib.Path(filename).suffix.lower()
+            if extension not in SUPPORTED_FILE_EXTENSIONS:
+                logger.warning(f"Unsupported file type: {filename}")
+                return 0, [], []
 
-        if extension == ".txt":
-            text_str = ""
+            # Read and validate file size
             try:
-                with open(final_path, "r", encoding="utf-8") as ff:
-                    text_str = ff.read()
-            except UnicodeDecodeError:
-                with open(final_path, "r", encoding="latin-1") as ff:
-                    text_str = ff.read()
-
-            if not text_str.strip():
-                raise HTTPException(
-                    status_code=400, detail=f"File {upl_file.filename} is empty."
-                )
-
-            txt_chunks = chunk_text(text_str, CHUNK_SIZE)
-            txt_embs = await embed_texts_in_batches(txt_chunks)
-            if txt_embs.shape[0] != len(txt_chunks):
-                raise HTTPException(
-                    status_code=500, detail="Mismatch chunk vs embedding count."
-                )
-
-            bulk_index_unstructured(
-                user_id, doc_id, txt_chunks, txt_embs, resourceType=None
-            )
-
-        elif (
-            extension == ".md"
-        ):  # for Markdown files, convert to plain text using our helper function
-            md_text = ""
-            try:
-                md_text = parse_markdown_file(final_path)
-            except Exception as ex:
-                raise HTTPException(
-                    status_code=500, detail=f"Markdown parse error: {ex}"
-                )
-
-            if not md_text.strip():
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"File {upl_file.filename} is empty after parsing.",
-                )
-
-            md_chunks = chunk_text(md_text, CHUNK_SIZE)
-            md_embs = await embed_texts_in_batches(md_chunks)
-            if md_embs.shape[0] != len(md_chunks):
-                raise HTTPException(
-                    status_code=500,
-                    detail="Mismatch chunk vs embedding count for Markdown file.",
-                )
-
-            bulk_index_unstructured(
-                user_id, doc_id, md_chunks, md_embs, resourceType=None
-            )
-
-        elif extension == ".json":
-            try:
-                with open(final_path, "r", encoding="utf-8") as ff:
-                    bundle_json = json.load(ff)
-            except UnicodeDecodeError:
-                with open(final_path, "r", encoding="latin-1") as ff:
-                    bundle_json = json.load(ff)
+                content = await read_file_content(file, MAX_FILE_SIZE)
+            except HTTPException as e:
+                logger.error(f"File size error for {filename}: {e.detail}")
+                raise e
             except Exception as e:
-                raise HTTPException(status_code=400, detail=f"JSON parse error: {e}")
+                logger.error(f"Error reading file {filename}: {e}")
+                return 0, [], []
 
-            structured_docs, unstructured_docs = parse_fhir_bundle(bundle_json)
-            bulk_index_structured(user_id, doc_id, structured_docs)
-            for udoc in unstructured_docs:
-                text = udoc.get("unstructuredText", "")
-                resType = udoc.get("resourceType", "")
-                sub_doc_id = udoc.get("doc_id", f"{doc_id}_{resType}")
-                if text.strip():
-                    un_chunks = chunk_text(text, CHUNK_SIZE)
-                    un_embs = await embed_texts_in_batches(un_chunks)
-                    if un_embs.shape[0] != len(un_chunks):
-                        raise HTTPException(
-                            status_code=500,
-                            detail="Mismatch chunk vs embedding count for unstructured text in FHIR.",
+            # Save to temporary file
+            with tempfile.NamedTemporaryFile(delete=False, suffix=extension) as tmp:
+                tmp.write(content)
+                tmp_path = tmp.name
+
+            try:
+                # Validate file path
+                valid_path = validate_file_path(tmp_path, read=True)
+                if not valid_path:
+                    logger.error(f"Invalid file after saving: {filename}")
+                    return 0, [], []
+
+                # Generate unique doc ID
+                doc_id = f"{pathlib.Path(filename).stem}_{uuid4().hex[:8]}"
+                final_path = os.path.join(user_folder, f"{doc_id}{extension}")
+
+                # Process file based on type
+                structured_docs, unstructured_docs = [], []
+                if extension == ".json":
+                    try:
+                        content_str = content.decode("utf-8")
+                        bundle_json = json.loads(content_str)
+                        if (
+                            not isinstance(bundle_json, dict)
+                            or "entry" not in bundle_json
+                        ):
+                            logger.error(f"Invalid FHIR bundle: {filename}")
+                            raise HTTPException(
+                                status_code=400, detail="Invalid FHIR bundle"
+                            )
+
+                        structured_docs, unstructured_docs = (
+                            parse_fhir_bundle_with_path(bundle_json, final_path)
                         )
-
-                    bulk_index_unstructured(
-                        user_id, sub_doc_id, un_chunks, un_embs, resourceType=resType
+                    except UnicodeDecodeError:
+                        content_str = content.decode("latin-1")
+                        bundle_json = json.loads(content_str)
+                        structured_docs, unstructured_docs = (
+                            parse_fhir_bundle_with_path(bundle_json, final_path)
+                        )
+                    except json.JSONDecodeError as e:
+                        logger.error(f"JSON parse error for {filename}: {e}")
+                        raise HTTPException(
+                            status_code=400, detail=f"JSON parse error: {e}"
+                        )
+                else:
+                    file_type = (
+                        FILE_TYPE_MARKDOWN if extension == ".md" else FILE_TYPE_TEXT
                     )
+                    structured_docs, unstructured_docs = parse_text_file(
+                        tmp_path, file_type
+                    )
+                    if not unstructured_docs and not structured_docs:
+                        logger.warning(f"No data extracted from {filename}")
+                        return 0, [], []
 
-        else:
-            raise HTTPException(
-                status_code=400, detail=f"Unsupported file type: {extension}"
-            )
+                # Move temporary file to final location
+                shutil.move(tmp_path, final_path)
+                logger.info(f"Successfully processed file: {filename}")
+                return 1, structured_docs, unstructured_docs
+            except Exception as e:
+                logger.error(f"Error processing {filename}: {e}")
+                return 0, [], []
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
 
-    return {"message": f"Uploaded and indexed {len(files)} file(s) for user={user_id}"}
+    # Process files concurrently
+    tasks = [process_file(file) for file in files]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Collect all documents for batch indexing
+    all_structured_docs = []
+    all_unstructured_docs = []
+    for result in results:
+        if isinstance(result, Exception):
+            logger.error(f"Task failed: {result}")
+            continue
+
+        count, structured, unstructured = result
+        processed_files += count
+        all_structured_docs.extend(structured)
+        all_unstructured_docs.extend(unstructured)
+
+    # Batch index all documents
+    if all_structured_docs or all_unstructured_docs:
+        await store_fhir_docs_in_opensearch(
+            all_structured_docs, all_unstructured_docs, os_client, index_name
+        )
+
+    if processed_files == 0:
+        logger.warning("No valid files were processed")
+        raise HTTPException(status_code=400, detail="No valid files were processed")
+
+    return {
+        "message": f"Uploaded and indexed {processed_files} file(s) for user={user_id}"
+    }
 
 
 if __name__ == "__main__":
