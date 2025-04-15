@@ -29,6 +29,18 @@ from opensearchpy.helpers import bulk
 
 from transformers import pipeline
 
+import logging
+from pathlib import Path
+import re
+import spacy
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler()],
+)
+logger = logging.getLogger(__name__)
 
 # Load .env file
 load_dotenv()
@@ -54,11 +66,14 @@ CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 512))
 EMBED_DIM = int(os.getenv("EMBED_DIM", 1024))
 
 EMB_DIR = os.getenv("EMB_DIR", "sample_dataset")
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "")
 
 OPENSEARCH_HOST = os.getenv("OPENSEARCH_HOST", "localhost")
 OPENSEARCH_PORT = int(os.getenv("OPENSEARCH_PORT", 9200))
 OPENSEARCH_INDEX_NAME = os.getenv("OPENSEARCH_INDEX_NAME", "")
 TOP_K = int(os.getenv("TOP_K", "3"))
+SHARD_COUNT = int(os.getenv("SHARD_COUNT", 1))
+REPLICA_COUNT = int(os.getenv("REPLICA_COUNT", 0))
 
 POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
 POSTGRES_PORT = os.getenv("POSTGRES_PORT", "5432")
@@ -72,8 +87,61 @@ ADAPTIVE_CHUNKING = bool(
     os.getenv("ADAPTIVE_CHUNKING", True)
 )  # If True - chunk size can adapt based on text length
 
+SUPPORTED_FILE_EXTENSIONS = (".json", ".md", ".txt")
+FILE_TYPE_JSON = "json"
+FILE_TYPE_MARKDOWN = "markdown"
+FILE_TYPE_TEXT = "text"
+
 
 db = Prisma()  # prisma client init
+
+
+# ==============================================================================
+# Load the spaCy model
+spacy_model: str = os.getenv("SPACY_MODEL", "en_ner_bc5cdr_md")
+spacy_fallback_model: str = os.getenv("SPACY_FALLBACK_MODEL", "en_core_web_sm")
+try:
+    nlp = spacy.load(spacy_model)
+except:
+    nlp = spacy.load(spacy_fallback_model)
+    logger.warning("Loaded fallback spaCy model: en_core_web_sm")
+
+# Entity-to-field mapping for OpenSearch filters
+ENTITY_FIELD_MAP = {
+    "DISEASE": "conditionCodeText",
+    "CHEMICAL": "medRequestMedicationDisplay",
+    "LABTEST": "observationCodeText",
+    "ANATOMY": "observationCodeText",
+    "PERSON": "patientName",
+    "ORG": "organizationName",
+    "GENDER": "patientGender",
+    "PHONE": "patientTelecom",
+    "EMAIL": "patientTelecom",
+    "ADDRESS": "patientAddress",
+    "DOCTOR": "practitionerName",
+    "BIRTH_DATE": "patientDOB",
+    "SEVERITY": "conditionSeverity",
+    "OBS_VALUE": "observationValue",
+    "ICD10_CODE": "conditionCodeText",
+    "CPT_CODE": "procedureCodeText",
+    "LOINC_CODE": "observationCodeText",
+    "DATE": [
+        "conditionOnsetDateTime",
+        "observationIssued",
+        "encounterStart",
+        "medRequestAuthoredOn",
+        "procedurePerformedDateTime",
+        "allergyOnsetDateTime",
+    ],
+}
+
+# Regex patterns for custom entity recognition
+PHONE_PATTERN = r"\b(\d{3}[-.\s]?\d{3}[-.\s]?\d{4}|\(\d{3}\)\s*\d{3}-\d{4})\b"
+EMAIL_PATTERN = r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"
+DOCTOR_PATTERN = r"(?:Dr\.|Doctor)\s+([A-Za-z]+(?:\s+[A-Za-z]+)?)"
+ICD10_PATTERN = r"\b[A-Z]\d{2}(?:\.\d{1,4})?\b"
+CPT_PATTERN = r"\b\d{5}\b"
+LOINC_PATTERN = r"\b\d{3,5}-\d\b"
 
 
 # ==============================================================================
@@ -208,7 +276,13 @@ async def ensure_index_exists(client: OpenSearch, index_name: str):
     try:
         if not client.indices.exists(index_name):
             index_body = {
-                "settings": {"index": {"knn": True}},  # for vector search
+                "settings": {
+                    "index": {
+                        "knn": True,
+                        "number_of_shards": SHARD_COUNT,
+                        "number_of_replicas": REPLICA_COUNT,
+                    }
+                },  # for vector search
                 "mappings": {
                     "properties": {
                         # ----------------------------------------------------------------
@@ -217,26 +291,48 @@ async def ensure_index_exists(client: OpenSearch, index_name: str):
                         "doc_id": {"type": "keyword"},
                         "doc_type": {"type": "keyword"},
                         "resourceType": {"type": "keyword"},
+                        "file_path": {"type": "keyword"},
+                        "file_type": {"type": "keyword"},  # json, markdown, text
                         # ----------------------------------------------------------------
                         # FHIR "Patient" resource fields
                         # ----------------------------------------------------------------
                         "patientId": {"type": "keyword"},
-                        "patientName": {"type": "text"},
+                        "patientName": {
+                            "type": "text",
+                            "fields": {
+                                "keyword": {"type": "keyword", "ignore_above": 256}
+                            },
+                        },
                         "patientGender": {"type": "keyword"},
                         "patientDOB": {
                             "type": "date",
                             "format": "yyyy-MM-dd||strict_date_optional_time||epoch_millis",
                         },
-                        "patientAddress": {"type": "text"},
+                        "patientAddress": {
+                            "type": "text",
+                            "fields": {
+                                "keyword": {"type": "keyword", "ignore_above": 256}
+                            },
+                        },
                         "patientMaritalStatus": {"type": "keyword"},
                         "patientMultipleBirth": {"type": "integer"},
-                        "patientTelecom": {"type": "text"},
+                        "patientTelecom": {
+                            "type": "text",
+                            "fields": {
+                                "keyword": {"type": "keyword", "ignore_above": 256}
+                            },
+                        },
                         "patientLanguage": {"type": "keyword"},
                         # ----------------------------------------------------------------
                         # FHIR "Condition" resource fields
                         # ----------------------------------------------------------------
                         "conditionId": {"type": "keyword"},
-                        "conditionCodeText": {"type": "text"},
+                        "conditionCodeText": {
+                            "type": "text",
+                            "fields": {
+                                "keyword": {"type": "keyword", "ignore_above": 256}
+                            },
+                        },
                         "conditionCategory": {"type": "keyword"},
                         "conditionClinicalStatus": {"type": "keyword"},
                         "conditionVerificationStatus": {"type": "keyword"},
@@ -254,8 +350,18 @@ async def ensure_index_exists(client: OpenSearch, index_name: str):
                         # FHIR "Observation" resource fields
                         # ----------------------------------------------------------------
                         "observationId": {"type": "keyword"},
-                        "observationCodeText": {"type": "text"},
-                        "observationValue": {"type": "text"},
+                        "observationCodeText": {
+                            "type": "text",
+                            "fields": {
+                                "keyword": {"type": "keyword", "ignore_above": 256}
+                            },
+                        },
+                        "observationValue": {
+                            "type": "text",
+                            "fields": {
+                                "keyword": {"type": "keyword", "ignore_above": 256}
+                            },
+                        },
                         "observationUnit": {"type": "keyword"},
                         "observationInterpretation": {"type": "keyword"},
                         "observationEffectiveDateTime": {
@@ -292,7 +398,12 @@ async def ensure_index_exists(client: OpenSearch, index_name: str):
                         # FHIR "MedicationRequest" resource fields
                         # ----------------------------------------------------------------
                         "medRequestId": {"type": "keyword"},
-                        "medRequestMedicationDisplay": {"type": "text"},
+                        "medRequestMedicationDisplay": {
+                            "type": "text",
+                            "fields": {
+                                "keyword": {"type": "keyword", "ignore_above": 256}
+                            },
+                        },
                         "medRequestAuthoredOn": {
                             "type": "date",
                             "format": "date_time||strict_date_optional_time||epoch_millis",
@@ -307,7 +418,12 @@ async def ensure_index_exists(client: OpenSearch, index_name: str):
                         # FHIR "Procedure" resource fields
                         # ----------------------------------------------------------------
                         "procedureId": {"type": "keyword"},
-                        "procedureCodeText": {"type": "text"},
+                        "procedureCodeText": {
+                            "type": "text",
+                            "fields": {
+                                "keyword": {"type": "keyword", "ignore_above": 256}
+                            },
+                        },
                         "procedureStatus": {"type": "keyword"},
                         "procedurePerformedDateTime": {
                             "type": "date",
@@ -324,7 +440,12 @@ async def ensure_index_exists(client: OpenSearch, index_name: str):
                         "allergyType": {"type": "keyword"},
                         "allergyCategory": {"type": "keyword"},
                         "allergyCriticality": {"type": "keyword"},
-                        "allergyCodeText": {"type": "text"},
+                        "allergyCodeText": {
+                            "type": "text",
+                            "fields": {
+                                "keyword": {"type": "keyword", "ignore_above": 256}
+                            },
+                        },
                         "allergyOnsetDateTime": {
                             "type": "date",
                             "format": "date_time||strict_date_optional_time||epoch_millis",
@@ -334,7 +455,12 @@ async def ensure_index_exists(client: OpenSearch, index_name: str):
                         # FHIR "Practitioner" resource fields
                         # ----------------------------------------------------------------
                         "practitionerId": {"type": "keyword"},
-                        "practitionerName": {"type": "text"},
+                        "practitionerName": {
+                            "type": "text",
+                            "fields": {
+                                "keyword": {"type": "keyword", "ignore_above": 256}
+                            },
+                        },
                         "practitionerGender": {"type": "keyword"},
                         "practitionerSpecialty": {"type": "keyword"},
                         "practitionerAddress": {"type": "text"},
@@ -343,7 +469,12 @@ async def ensure_index_exists(client: OpenSearch, index_name: str):
                         # FHIR "Organization" resource fields
                         # ----------------------------------------------------------------
                         "organizationId": {"type": "keyword"},
-                        "organizationName": {"type": "text"},
+                        "organizationName": {
+                            "type": "text",
+                            "fields": {
+                                "keyword": {"type": "keyword", "ignore_above": 256}
+                            },
+                        },
                         "organizationType": {"type": "keyword"},
                         "organizationAddress": {"type": "text"},
                         "organizationTelecom": {"type": "text"},
@@ -414,6 +545,8 @@ def parse_fhir_bundle(bundle_json: Dict) -> Tuple[List[Dict], List[Dict]]:
             "doc_id": f"{rtype}-{rid}-structured",
             "doc_type": "structured",
             "resourceType": rtype,
+            "file_path": None,
+            "file_type": FILE_TYPE_JSON,
             # Patient
             "patientId": None,
             "patientName": None,
@@ -496,8 +629,7 @@ def parse_fhir_bundle(bundle_json: Dict) -> Tuple[List[Dict], List[Dict]]:
             "organizationType": None,
             "organizationAddress": None,
             "organizationTelecom": None,
-            # We do not store embeddings in structured docs
-            # unstructured docs will have "embedding" once we embed them
+            # We don't store embeddings in structured docs - unstructured docs will have "embedding" once embedded
         }
 
         # gather unstructured text from various narrative or note fields
@@ -914,12 +1046,80 @@ def parse_fhir_bundle(bundle_json: Dict) -> Tuple[List[Dict], List[Dict]]:
                     "doc_id": f"{rtype}-{rid}-unstructured-{c_i}",
                     "doc_type": "unstructured",
                     "resourceType": rtype,
+                    "file_path": None,
+                    "file_type": FILE_TYPE_JSON,
+                    "patientId": sdoc["patientId"],
                     # storing the text in 'unstructuredText' field
                     "unstructuredText": chunk_str,
                 }
                 unstructured_docs.append(udoc)
 
     return (structured_docs, unstructured_docs)
+
+
+def parse_fhir_bundle_with_path(
+    bundle_json: Dict, file_path: str
+) -> Tuple[List[Dict], List[Dict]]:
+    structured_docs, unstructured_docs = parse_fhir_bundle(bundle_json)
+    file_upload_dir = Path(UPLOAD_DIR).resolve()
+    absolute_path = Path(file_path).resolve()
+    try:
+        relative_file_path = str(absolute_path.relative_to(file_upload_dir))
+    except ValueError:
+        logger.warning(
+            f"File {file_path} is not under FILE_DIR {file_upload_dir}, using absolute path"
+        )
+        relative_file_path = str(absolute_path)
+
+    for doc in structured_docs:
+        doc["file_path"] = relative_file_path
+
+    for doc in unstructured_docs:
+        doc["file_path"] = relative_file_path
+
+    return structured_docs, unstructured_docs
+
+
+def parse_text_file(file_path: str, file_type: str) -> Tuple[List[Dict], List[Dict]]:
+    structured_docs = []
+    unstructured_docs = []
+    emb_dir = Path(UPLOAD_DIR).resolve()
+    absolute_path = Path(file_path).resolve()
+    try:
+        relative_file_path = str(absolute_path.relative_to(emb_dir))
+    except ValueError:
+        logger.warning(
+            f"File {file_path} is not under EMB_DIR {emb_dir}, using absolute path"
+        )
+        relative_file_path = str(absolute_path)
+    patient_id = infer_patient_id_from_filename(absolute_path.name)
+    try:
+        with absolute_path.open("r", encoding="utf-8") as f:
+            content = f.read().strip()
+    except UnicodeDecodeError:
+        with absolute_path.open("r", encoding="latin-1") as f:
+            content = f.read().strip()
+    except Exception as e:
+        logger.error(f"Failed to read text file {file_path}: {e}")
+        return structured_docs, unstructured_docs
+    if not content:
+        logger.warning(f"Empty text file: {file_path}")
+        return structured_docs, unstructured_docs
+    text_chunks = chunk_text(content, chunk_size=CHUNK_SIZE)
+    for i, chunk in enumerate(text_chunks):
+        doc_id = f"{file_type}-{absolute_path.stem}-{i}"
+        unstructured_docs.append(
+            {
+                "doc_id": doc_id,
+                "doc_type": "unstructured",
+                "resourceType": file_type,
+                "file_path": relative_file_path,
+                "file_type": file_type,
+                "patientId": patient_id,
+                "unstructuredText": chunk,
+            }
+        )
+    return structured_docs, unstructured_docs
 
 
 async def store_fhir_docs_in_opensearch(
@@ -1331,6 +1531,18 @@ class OpenSearchIndexer:
             print(f"[OpenSearchIndexer - hybrid_search] Error: {e}")
             return []
 
+    def aggregate_search(
+        self, query: str, filter_clause: Optional[Dict] = None
+    ) -> Dict:
+        agg_body = {
+            "size": 0,
+            "aggs": {"by_condition": {"terms": {"field": "conditionCodeText"}}},
+        }
+        if filter_clause:
+            agg_body["query"] = filter_clause
+        resp = self.client.search(index=self.index_name, body=agg_body)
+        return resp["aggregations"]
+
 
 # ==============================================================================
 # Basic Pre-processing Functions
@@ -1352,42 +1564,167 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
     return chunks
 
 
-# ----------------------------------------------------------------------
-# ZeroShotQueryClassifier
-# ---------------------------------------------------------
-class ZeroShotQueryClassifier:
+def validate_file_path(
+    file_path: str, base_dir: str = None, read: bool = False
+) -> Optional[Path]:
     """
-    A zero-shot classification approach for dynamic labeling of queries like:
-    - "SEMANTIC" => Vector-based search
-    - "KEYWORD"  => Exact / BM25 search
-    - "HYBRID"   => Combination
+    Validate a file path. If base_dir is provided, treat file_path as relative.
+    If read=True, check readability.
+    Accepts .json, .md, .txt files.
+    Returns Path object if valid, None otherwise.
     """
+    try:
+        if base_dir:
+            path = Path(base_dir) / file_path
+        else:
+            path = Path(file_path)
+        path = path.resolve()
+        if not path.exists():
+            logger.error(f"File does not exist: {path}")
+            return None
+        if not path.is_file():
+            logger.error(f"Path is not a file: {path}")
+            return None
+        if path.suffix.lower() not in SUPPORTED_FILE_EXTENSIONS:
+            logger.error(f"Unsupported file extension: {path}")
+            return None
+        if read:
+            with path.open("r", encoding="utf-8") as f:
+                content = f.read()
+                if not content.strip():
+                    logger.error(f"File is empty: {path}")
+                    return None
+        return path
+    except PermissionError:
+        logger.error(f"Permission denied for file: {path}")
+        return None
+    except UnicodeDecodeError:
+        logger.error(f"File is not valid UTF-8: {path}")
+        return None
+    except Exception as e:
+        logger.error(f"Invalid file path {path}: {e}")
+        return None
 
-    def __init__(self):
-        self.candidate_labels = ["SEMANTIC", "KEYWORD", "HYBRID"]
-        # Create pipeline
-        self._pipe = pipeline(
-            task="zero-shot-classification",
-            model=QUERY_INTENT_CLASSIFICATION_MODEL,
-            tokenizer=QUERY_INTENT_CLASSIFICATION_MODEL,
+
+def infer_patient_id_from_filename(filename: str) -> Optional[str]:
+    """
+    Infer patientId from filename, e.g., 'patient_123_notes.md' -> '123'.
+    Returns None if no patientId is found.
+    """
+    match = re.search(r"patient_(\d+)", filename, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+# Intent classifier (zero-shot)
+intent_classifier = pipeline(
+    "zero-shot-classification", model=QUERY_INTENT_CLASSIFICATION_MODEL
+)
+
+# Intent categories
+INTENT_CATEGORIES = [
+    "SEMANTIC",
+    "KEYWORD",
+    "HYBRID",
+    "STRUCTURED",
+    "HYBRID_STRUCTURED",
+    "AGGREGATE",
+    "COMPARISON",
+    "TEMPORAL",
+    "EXPLANATORY",
+    "MULTI_INTENT",
+    "ENTITY_SPECIFIC",
+    "DOCUMENT_FETCH",
+]
+
+
+# ==============================================================================
+# NER and Intent Preprocessing
+# ==============================================================================
+def ner_preprocess(query: str) -> Optional[Dict]:
+    doc = nlp(query)
+    must_filters = []
+
+    # spaCy entities
+    for ent in doc.ents:
+        label = ent.label_.upper()
+        if label in ENTITY_FIELD_MAP:
+            fields = ENTITY_FIELD_MAP[label]
+            value = ent.text.strip().lower()
+            if label == "DATE":
+                for field in fields:
+                    try:
+                        must_filters.append(
+                            {"range": {field: {"gte": value, "lte": value}}}
+                        )
+                    except Exception as e:
+                        logger.warning(f"Invalid date format for {value}: {e}")
+            elif label == "PERSON":
+                # Differentiate patient vs. practitioner
+                if "doctor" in query.lower() or "dr." in query.lower():
+                    must_filters.append({"match_phrase": {"practitionerName": value}})
+                else:
+                    must_filters.append({"match_phrase": {"patientName": value}})
+            else:
+                must_filters.append({"match_phrase": {fields: value}})
+
+    # Custom regex-based entities
+    patterns = {
+        "PHONE": (PHONE_PATTERN, "patientTelecom"),
+        "EMAIL": (EMAIL_PATTERN, "patientTelecom"),
+        "ICD10_CODE": (ICD10_PATTERN, "conditionCodeText"),
+        "CPT_CODE": (CPT_PATTERN, "procedureCodeText"),
+        "LOINC_CODE": (LOINC_PATTERN, "observationCodeText"),
+    }
+    for label, (pattern, field) in patterns.items():
+        matches = re.findall(pattern, query, re.IGNORECASE)
+        for match in matches:
+            must_filters.append({"match_phrase": {field: match.strip().lower()}})
+
+    # Doctor name
+    doctor_matches = re.findall(DOCTOR_PATTERN, query, re.IGNORECASE)
+    for match in doctor_matches:
+        must_filters.append(
+            {"match_phrase": {"practitionerName": match.strip().lower()}}
         )
-        # Thread executor to avoid blocking
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
-    def _sync_classify(self, query: str) -> str:
-        classification = self._pipe(
-            sequences=query, candidate_labels=self.candidate_labels, multi_label=False
+    # Gender keywords
+    gender_keywords = ["male", "female", "man", "woman", "boy", "girl"]
+    for keyword in gender_keywords:
+        if keyword in query.lower():
+            must_filters.append({"match_phrase": {"patientGender": keyword}})
+
+    # Birth date
+    if "born" in query.lower() or "birth" in query.lower():
+        date_matches = re.findall(r"\b\d{4}-\d{2}-\d{2}\b", query)
+        for date in date_matches:
+            must_filters.append({"match_phrase": {"patientDOB": date}})
+
+    return {"bool": {"must": must_filters}} if must_filters else None
+
+
+def classify_intent(query: str) -> str:
+    query_lower = query.lower()
+    if "how many" in query_lower or "count" in query_lower:
+        return "AGGREGATE"
+    elif "compare" in query_lower or "versus" in query_lower:
+        return "COMPARISON"
+    elif "over time" in query_lower or "trend" in query_lower:
+        return "TEMPORAL"
+    elif "what is" in query_lower or "explain" in query_lower:
+        return "EXPLANATORY"
+    elif (
+        "fetch document" in query_lower
+        or "get record" in query_lower
+        or "retrieve file" in query_lower
+    ):
+        return "DOCUMENT_FETCH"
+    elif re.search(r"\bpatient\b", query_lower):
+        return "ENTITY_SPECIFIC"
+    else:
+        classification = intent_classifier(
+            query, candidate_labels=INTENT_CATEGORIES, multi_label=False
         )
         return classification["labels"][0]
-
-    async def classify_intent(self, query: str) -> str:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self._executor, self._sync_classify, query
-        )  # label
-
-
-intent_classifier = ZeroShotQueryClassifier()
 
 
 # ==============================================================================
@@ -1514,9 +1851,10 @@ async def ask(
     if not chat or chat.userId != user_id:
         raise HTTPException(status_code=403, detail="Chat not found or unauthorized")
 
-    # DistilBERT zero shot classification => "SEMANTIC", "KEYWORD", or "HYBRID"
-    intent = await intent_classifier.classify_intent(query)
-    print(f"[Debug] Query Intent = {intent}")
+    #  apply NER and intent classification
+    filter_clause = ner_preprocess(query)
+    intent = classify_intent(query)
+    print(f"[Debug] Intent = {intent}, Filter Clause = {filter_clause}")
 
     # fetch last 'MAX_CHAT_HISTORY' messages for context
     messages = await db.message.find_many(
@@ -1540,11 +1878,25 @@ async def ask(
 
     # OpenSearch Retrieval
     if intent == "SEMANTIC":
-        partial_results = os_indexer.semantic_search(query_emb, k=top_k)
+        partial_results = os_indexer.semantic_search(
+            query_emb, k=top_k, filter_clause=filter_clause
+        )
     elif intent == "KEYWORD":
-        partial_results = os_indexer.exact_match_search(query, k=top_k)
+        partial_results = os_indexer.exact_match_search(
+            query, k=top_k, filter_clause=filter_clause
+        )
+    elif intent == "HYBRID":
+        partial_results = os_indexer.hybrid_search(
+            query, query_emb, k=top_k, filter_clause=filter_clause
+        )
+    elif intent == "AGGREGATE":
+        agg_result = os_indexer.aggregate_search(query, filter_clause)
+        return json.dumps(agg_result)
     else:
-        partial_results = os_indexer.hybrid_search(query, query_emb, k=top_k)
+        # Fallback to hybrid for unhandled intents
+        partial_results = os_indexer.hybrid_search(
+            query, query_emb, k=top_k, filter_clause=filter_clause
+        )
 
     context_map = {}
     for doc_dict, _score in partial_results:
