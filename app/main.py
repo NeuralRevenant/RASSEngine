@@ -26,14 +26,18 @@ from fastapi import (
 from opensearchpy import OpenSearch, RequestsHttpConnection
 from opensearchpy.helpers import bulk
 
-from transformers import pipeline
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    BertForTokenClassification,
+    BertTokenizerFast,
+)
 import torch
 from datetime import datetime, timezone
 
 import logging
 from pathlib import Path
 import re
-import spacy
 
 # Configure logging
 logging.basicConfig(
@@ -49,10 +53,10 @@ load_dotenv()
 # ==============================================================================
 # Global Constants & Configuration
 # ==============================================================================
+NER_MODEL_PATH = os.getenv("NER_MODEL_PATH", "./ner_model/final")
+INTENT_MODEL_PATH = os.getenv("INTENT_MODEL_PATH", "./intent_model/final")
 EMBED_MODEL_NAME = os.getenv("OLLAMA_EMBED_MODEL", "mxbai-embed-large:latest")
-QUERY_INTENT_CLASSIFICATION_MODEL = os.getenv(
-    "QUERY_INTENT_CLASSIFICATION_MODEL", "facebook/bart-large-mnli"
-)
+
 
 MAX_BLUEHIVE_CONCURRENCY = int(os.getenv("MAX_BLUEHIVE_CONCURRENCY", 5))
 MAX_EMBED_CONCURRENCY = int(os.getenv("MAX_EMBED_CONCURRENCY", 5))
@@ -99,30 +103,38 @@ db = Prisma()  # prisma client init
 
 
 # ==============================================================================
-# Load the spaCy model
-spacy_model: str = os.getenv("SPACY_MODEL", "en_ner_bc5cdr_md")
-spacy_fallback_model: str = os.getenv("SPACY_FALLBACK_MODEL", "en_core_web_sm")
+# Load Trained Models
+# ==============================================================================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logger.info(f"Using device: {device}")
+
 try:
-    nlp = spacy.load(spacy_model)
-except:
-    nlp = spacy.load(spacy_fallback_model)
-    logger.warning("Loaded fallback spaCy model: en_core_web_sm")
+    ner_model = BertForTokenClassification.from_pretrained(NER_MODEL_PATH).to(device)
+    ner_tokenizer = BertTokenizerFast.from_pretrained(NER_MODEL_PATH)
+    logger.info(f"Loaded NER model from {NER_MODEL_PATH}")
+except Exception as e:
+    logger.error(f"Failed to load NER model: {e}")
+    raise
+
+try:
+    intent_model = AutoModelForSequenceClassification.from_pretrained(
+        INTENT_MODEL_PATH
+    ).to(device)
+    intent_tokenizer = AutoTokenizer.from_pretrained(INTENT_MODEL_PATH)
+    logger.info(f"Loaded intent model from {INTENT_MODEL_PATH}")
+except Exception as e:
+    logger.error(f"Failed to load intent model: {e}")
+    raise
 
 # Entity-to-field mapping for OpenSearch filters
 ENTITY_FIELD_MAP = {
-    "DISEASE": "conditionCodeText",
-    "CHEMICAL": "medRequestMedicationDisplay",
+    "PERSON": "patientName",
+    "DOCTOR": "practitionerName",
+    "CONDITION": "conditionCodeText",
+    "MEDICATION": "medRequestMedicationDisplay",
+    "PROCEDURE": "procedureCodeText",
     "LABTEST": "observationCodeText",
     "ANATOMY": "observationCodeText",
-    "PERSON": "patientName",
-    "ORG": "organizationName",
-    "GENDER": "patientGender",
-    "PHONE": "patientTelecom",
-    "EMAIL": "patientTelecom",
-    "ADDRESS": "patientAddress",
-    "DOCTOR": "practitionerName",
-    "BIRTH_DATE": "patientDOB",
-    "SEVERITY": "conditionSeverity",
     "OBS_VALUE": "observationValue",
     "ICD10_CODE": "conditionCodeText",
     "CPT_CODE": "procedureCodeText",
@@ -135,15 +147,14 @@ ENTITY_FIELD_MAP = {
         "procedurePerformedDateTime",
         "allergyOnsetDateTime",
     ],
+    "GENDER": "patientGender",
+    "PHONE": "patientTelecom",
+    "EMAIL": "patientTelecom",
+    "ADDRESS": "patientAddress",
+    "ORGANIZATION": "organizationName",
+    "SEVERITY": "conditionSeverity",
+    "ALLERGY": "allergyCodeText",
 }
-
-# Regex patterns for custom entity recognition
-PHONE_PATTERN = r"\b(\d{3}[-.\s]?\d{3}[-.\s]?\d{4}|\(\d{3}\)\s*\d{3}-\d{4})\b"
-EMAIL_PATTERN = r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"
-DOCTOR_PATTERN = r"(?:Dr\.|Doctor)\s+([A-Za-z]+(?:\s+[A-Za-z]+)?)"
-ICD10_PATTERN = r"\b[A-Z]\d{2}(?:\.\d{1,4})?\b"
-CPT_PATTERN = r"\b\d{5}\b"
-LOINC_PATTERN = r"\b\d{3,5}-\d\b"
 
 
 # ==============================================================================
@@ -2091,16 +2102,56 @@ Examples:
 # NER and Intent Preprocessing
 # ==============================================================================
 def ner_preprocess(query: str) -> Optional[Dict]:
-    doc = nlp(query)
-    must_filters = []
+    inputs = ner_tokenizer(
+        query, return_tensors="pt", truncation=True, padding=True, max_length=128
+    ).to(device)
+    with torch.no_grad():
+        outputs = ner_model(**inputs)
+    logits = outputs.logits
+    predictions = torch.argmax(logits, dim=-1)[0].cpu().numpy()
+    tokens = ner_tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
+    id2label = ner_model.config.id2label
 
-    # spaCy entities
-    for ent in doc.ents:
-        label = ent.label_.upper()
-        if label in ENTITY_FIELD_MAP:
-            fields = ENTITY_FIELD_MAP[label]
-            value = ent.text.strip().lower()
-            if label == "DATE":
+    entities = []
+    current_entity = None
+    current_text = []
+    for token, pred_id in zip(tokens, predictions):
+        label = id2label[pred_id]
+        if token in ["[CLS]", "[SEP]", "[PAD]"]:
+            continue
+        if label.startswith("B-"):
+            if current_entity:
+                entities.append(
+                    {"text": " ".join(current_text), "label": current_entity}
+                )
+                current_text = []
+            current_entity = label[2:]
+            current_text.append(token.replace("##", ""))
+        elif label.startswith("I-") and current_entity == label[2:]:
+            current_text.append(token.replace("##", ""))
+        else:
+            if current_entity:
+                entities.append(
+                    {"text": " ".join(current_text), "label": current_entity}
+                )
+                current_text = []
+                current_entity = None
+            if label != "O":
+                current_entity = label[2:] if label.startswith("B-") else None
+                current_text = [token.replace("##", "")] if current_entity else []
+
+    if current_entity and current_text:
+        entities.append({"text": " ".join(current_text), "label": current_entity})
+
+    must_filters = []
+    for entity in entities:
+        label = entity["label"]
+        value = entity["text"].strip().lower()
+        if label not in ENTITY_FIELD_MAP:
+            continue
+        fields = ENTITY_FIELD_MAP[label]
+        if label == "DATE":
+            if isinstance(fields, list):
                 for field in fields:
                     try:
                         must_filters.append(
@@ -2108,90 +2159,31 @@ def ner_preprocess(query: str) -> Optional[Dict]:
                         )
                     except Exception as e:
                         logger.warning(f"Invalid date format for {value}: {e}")
-            elif label == "PERSON":
-                # Differentiate patient vs practitioner
-                if "doctor" in query.lower() or "dr." in query.lower():
-                    must_filters.append({"match_phrase": {"practitionerName": value}})
-                else:
-                    must_filters.append({"match_phrase": {"patientName": value}})
-            else:
-                must_filters.append({"match_phrase": {fields: value}})
-
-    # Custom regex-based entities
-    patterns = {
-        "PHONE": (PHONE_PATTERN, "patientTelecom"),
-        "EMAIL": (EMAIL_PATTERN, "patientTelecom"),
-        "ICD10_CODE": (ICD10_PATTERN, "conditionCodeText"),
-        "CPT_CODE": (CPT_PATTERN, "procedureCodeText"),
-        "LOINC_CODE": (LOINC_PATTERN, "observationCodeText"),
-    }
-    for label, (pattern, field) in patterns.items():
-        matches = re.findall(pattern, query, re.IGNORECASE)
-        for match in matches:
-            must_filters.append({"match_phrase": {field: match.strip().lower()}})
-
-    # Doctor name
-    doctor_matches = re.findall(DOCTOR_PATTERN, query, re.IGNORECASE)
-    for match in doctor_matches:
-        must_filters.append(
-            {"match_phrase": {"practitionerName": match.strip().lower()}}
-        )
-
-    # Gender keywords
-    gender_keywords = ["male", "female", "man", "woman", "boy", "girl"]
-    for keyword in gender_keywords:
-        if keyword in query.lower():
-            must_filters.append({"match_phrase": {"patientGender": keyword}})
-
-    # Birth date
-    if "born" in query.lower() or "birth" in query.lower():
-        date_matches = re.findall(r"\b\d{4}-\d{2}-\d{2}\b", query)
-        for date in date_matches:
-            must_filters.append({"match_phrase": {"patientDOB": date}})
+        else:
+            field = fields if isinstance(fields, str) else fields[0]
+            must_filters.append({"match_phrase": {field: value}})
 
     return {"bool": {"must": must_filters}} if must_filters else None
 
 
 def classify_intent(query: str) -> str:
-    query_lower = query.lower()
-    if "how many" in query_lower or "count" in query_lower:
-        return "AGGREGATE"
-    elif "compare" in query_lower or "versus" in query_lower:
-        return "COMPARISON"
-    elif "over time" in query_lower or "trend" in query_lower:
-        return "TEMPORAL"
-    elif "what is" in query_lower or "explain" in query_lower:
-        return "EXPLANATORY"
-    elif (
-        "fetch document" in query_lower
-        or "get record" in query_lower
-        or "retrieve file" in query_lower
-    ):
-        return "DOCUMENT_FETCH"
-    elif re.search(r"\bpatient\b.*\bdetails\b", query_lower) or re.search(
-        r"\bpatients?\b.*\bwith\b", query_lower
-    ):
-        return "HYBRID"  # Enhanced rule for patient detail queries
-    elif re.search(r"\bpatient\b", query_lower):
-        return "ENTITY_SPECIFIC"
+    inputs = intent_tokenizer(
+        query, return_tensors="pt", truncation=True, padding=True, max_length=128
+    ).to(device)
+    with torch.no_grad():
+        outputs = intent_model(**inputs)
 
-    # Few-shot inference (Incontext Learning)
-    prompt = f"{FEW_SHOT_EXAMPLES}\nQuery: {query}\nClassification: "
+    logits = outputs.logits
+    predicted_id = torch.argmax(logits, dim=-1).item()
     try:
-        classification = intent_classifier(
-            f"{FEW_SHOT_EXAMPLES}\nQuery: {query}\nIntent: ",
-            candidate_labels=INTENT_CATEGORIES,
-            multi_label=False,
-        )
-        intent = classification["labels"][0].upper()
+        intent = intent_model.config.id2label[predicted_id].upper()
         if intent not in INTENT_CATEGORIES:
-            logger.warning(f"Invalid classification '{intent}', falling back to HYBRID")
+            logger.warning(f"Invalid intent '{intent}', falling back to HYBRID")
             return "HYBRID"
-
         return intent
-    except Exception as e:
-        logger.error(f"Intent classification error: {e}")
-        return "HYBRID"  # Safe fallback
+    except KeyError:
+        logger.error("Intent ID not found in id2label, falling back to HYBRID")
+        return "HYBRID"
 
 
 # ==============================================================================
@@ -2512,7 +2504,7 @@ async def ask_websocket_endpoint(websocket: WebSocket):
             await websocket.close()
             return
 
-        print(
+        logger.info(
             f"[WebSocket Debug] user_id={user_id}, chat_id={chat_id}, query={query}, top_k={top_k}"
         )
 
@@ -2524,6 +2516,14 @@ async def ask_websocket_endpoint(websocket: WebSocket):
             )
             await websocket.close()
             return
+
+        # apply NER and intent classification
+        filter_clause = ner_preprocess(query)
+        intent = classify_intent(query)
+        patient_id = infer_patient_id_from_filename(query) or None
+        logger.info(
+            f"[WebSocket Debug] Intent: {intent}, Filter Clause: {filter_clause}, Patient ID: {patient_id}"
+        )
 
         # Fetch chat history
         messages = await db.message.find_many(
@@ -2539,32 +2539,161 @@ async def ask_websocket_endpoint(websocket: WebSocket):
             chat_history_str += f"{role_label}: {m.content}\n"
 
         query_emb = await embed_query(query)
-
-        # classify intent asynchronously
-        intent = await classify_intent(query)
-        print(f"[WebSocket Debug] Query Intent = {intent}")
-
         index_name = get_index_name(user_id)
         await ensure_index_exists(os_client, index_name)
         os_indexer = OpenSearchIndexer(os_client, index_name)
 
         # perform retrieval based on intent
-        if intent == "SEMANTIC":
-            partial_results = os_indexer.semantic_search(query_emb, k=top_k)
-        elif intent == "KEYWORD":
-            partial_results = os_indexer.exact_match_search(query, k=top_k)
-        else:  # hyb
-            partial_results = os_indexer.hybrid_search(query, query_emb, k=top_k)
+        if intent == "DOCUMENT_FETCH":
+            results = os_indexer.document_fetch_search(
+                query, k=top_k, filter_clause=filter_clause, patient_id=patient_id
+            )
+            if not results:
+                await websocket.send_text(
+                    json.dumps({"answer": "No matching documents found."})
+                )
+                await websocket.close()
+                return
+
+            patient_files = {}
+            for doc, score in results:
+                patient_id = doc.get("patientId")
+                file_path = doc.get("file_path")
+                file_type = doc.get("file_type", FILE_TYPE_JSON)
+                if patient_id and file_path:
+                    if patient_id not in patient_files:
+                        patient_files[patient_id] = set()
+                    patient_files[patient_id].add((file_path, file_type))
+
+            if not patient_files:
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "answer": "No documents with valid patient ID or file path found."
+                        }
+                    )
+                )
+                await websocket.close()
+                return
+
+            retrieved_docs = []
+            for patient_id, file_info in patient_files.items():
+                file_count = 0
+                for file_path, file_type in file_info:
+                    if file_count >= MAX_FILES_PER_PATIENT:
+                        logger.warning(
+                            f"Reached MAX_FILES_PER_PATIENT ({MAX_FILES_PER_PATIENT}) for patient {patient_id}"
+                        )
+                        break
+                    if ehr_doc := await retrieve_ehr_document(file_path):
+                        retrieved_docs.append(
+                            {
+                                "patientId": patient_id,
+                                "file_path": file_path,
+                                "file_type": file_type,
+                                "content": ehr_doc["content"],
+                            }
+                        )
+                        file_count += 1
+
+            if not retrieved_docs:
+                await websocket.send_text(
+                    json.dumps(
+                        {"answer": "No accessible documents found for the patient."}
+                    )
+                )
+                await websocket.close()
+                return
+
+            final_answer = json.dumps({"patient_records": retrieved_docs}, indent=2)
+            await websocket.send_text(final_answer)
+
+            current_time = datetime.now(timezone.utc).isoformat()
+            await db.message.create_many(
+                [
+                    {
+                        "chatId": chat_id,
+                        "role": "user",
+                        "content": query,
+                        "createdAt": current_time,
+                    },
+                    {
+                        "chatId": chat_id,
+                        "role": "assistant",
+                        "content": final_answer,
+                        "createdAt": current_time,
+                    },
+                ]
+            )
+            await websocket.close()
+            return
+
+        search_methods = {
+            "SEMANTIC": os_indexer.semantic_search,
+            "KEYWORD": os_indexer.exact_match_search,
+            "HYBRID": os_indexer.hybrid_search,
+            "STRUCTURED": os_indexer.structured_search,
+            "HYBRID_STRUCTURED": os_indexer.hybrid_structured_search,
+            "AGGREGATE": os_indexer.aggregate_search,
+            "COMPARISON": os_indexer.comparison_search,
+            "TEMPORAL": os_indexer.temporal_search,
+            "EXPLANATORY": os_indexer.explanatory_search,
+            "MULTI_INTENT": os_indexer.multi_intent_search,
+            "ENTITY_SPECIFIC": os_indexer.entity_specific_search,
+        }
+        search_method = search_methods.get(intent, os_indexer.hybrid_search)
+
+        if intent == "AGGREGATE":
+            result = search_method(
+                query, filter_clause=filter_clause, patient_id=patient_id
+            )
+            final_answer = json.dumps(result, indent=2)
+            await websocket.send_text(final_answer)
+
+            current_time = datetime.now(timezone.utc).isoformat()
+            await db.message.create_many(
+                [
+                    {
+                        "chatId": chat_id,
+                        "role": "user",
+                        "content": query,
+                        "createdAt": current_time,
+                    },
+                    {
+                        "chatId": chat_id,
+                        "role": "assistant",
+                        "content": final_answer,
+                        "createdAt": current_time,
+                    },
+                ]
+            )
+            await websocket.close()
+            return
+
+        if intent in ["SEMANTIC", "HYBRID", "HYBRID_STRUCTURED", "MULTI_INTENT"]:
+            partial_results = search_method(
+                query=query,
+                query_emb=query_emb,
+                k=top_k,
+                filter_clause=filter_clause,
+                patient_id=patient_id,
+            )
+        else:
+            partial_results = search_method(
+                query=query,
+                k=top_k,
+                filter_clause=filter_clause,
+                patient_id=patient_id,
+            )
 
         context_map = {}
         for doc_dict, _score in partial_results:
             doc_id = doc_dict.get("doc_id", "UNKNOWN")
 
             if doc_dict.get("doc_type", "structured") == "unstructured":
-                # just show the unstructuredText - improvement may be planned later
-                snippet = f"[Unstructured Text]: {doc_dict.get('unstructuredText', '')}"
+                raw_text = doc_dict.get("unstructuredText", "")
+                snippet = f"[Unstructured Text]: {raw_text}"
             else:
-                # gather all non-empty fields for "structured" docs
                 snippet_pieces = [
                     f"{k}={v}"
                     for k, v in doc_dict.items()
@@ -2578,22 +2707,18 @@ async def ask_websocket_endpoint(websocket: WebSocket):
             else:
                 context_map[doc_id] += "\n" + snippet
 
-        # Build a short context
         context_text = ""
         for doc_id, doc_content in context_map.items():
-            print(doc_id)
             context_text += f"--- Document ID: {doc_id} ---\n{doc_content}\n\n"
 
-        # build the prompt with chat history and current query
         system_msg = (
-            "You are a helpful AI assistant chatbot. You must follow these rules:\n"
+            "You are a helpful medical AI assistant chatbot with access to FHIR-based, markdown, and plain-text EHR data. You must follow these rules and provide accurate and professional answers based on the query and context:\n"
             "1) Always cite document IDs from the context exactly as 'Document XYZ' without any file extensions like '.txt'.\n"
             "2) For every answer generated, there should be a reference or citation of the IDs of the documents from which the answer information was extracted at the end of the answer!\n"
             "3) If the context does not relate to the query, say 'I lack the context to answer your question.' For example, if the query is about gene mutations but the context is about climate change, acknowledge the mismatch and do not answer.\n"
             "4) Never ever give responses based on your own knowledge of the user query. Use ONLY the provided context + chat history to extract information relevant to the question. You should not answer without document ID references from which the information was extracted.\n"
             "5) If you lack context, then say so.\n"
             "6) Do not add chain-of-thought.\n"
-            # "7) Answer in at most 4 sentences.\n"
         )
         final_prompt = (
             f"Chat History:\n{chat_history_str}\n\n"
@@ -2603,30 +2728,37 @@ async def ask_websocket_endpoint(websocket: WebSocket):
             "Provide your concise answer now."
         )
 
-        # stream the generation token-by-token
         streamed_chunks = []
         async for chunk in openai_generate_text_stream(final_prompt, system_msg):
             streamed_chunks.append(chunk)
-            # send/stream each chunk immediately to the client
             await websocket.send_text(chunk)
 
-        # After finishing, store the full response in Redis
         final_answer = "".join(streamed_chunks).strip()
         if final_answer:
-            # Store query & answer/resp in DB
-            await db.message.create(
-                data={"chatId": chat_id, "role": "user", "content": query}
-            )
-            await db.message.create(
-                data={"chatId": chat_id, "role": "assistant", "content": final_answer}
+            current_time = datetime.now(timezone.utc).isoformat()
+            await db.message.create_many(
+                [
+                    {
+                        "chatId": chat_id,
+                        "role": "user",
+                        "content": query,
+                        "createdAt": current_time,
+                    },
+                    {
+                        "chatId": chat_id,
+                        "role": "assistant",
+                        "content": final_answer,
+                        "createdAt": current_time,
+                    },
+                ]
             )
 
         await websocket.close()
 
     except WebSocketDisconnect:
-        print("[WebSocket] Client disconnected mid-stream.")
+        logger.info("[WebSocket] Client disconnected mid-stream.")
     except Exception as e:
-        print(f"[WebSocket] Unexpected error: {e}")
+        logger.error(f"[WebSocket] Unexpected error: {e}")
         await websocket.send_text(
             json.dumps({"error": "Internal server error occurred."})
         )
