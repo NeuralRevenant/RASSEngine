@@ -1872,6 +1872,7 @@ class OpenSearchIndexer:
     ) -> List[Tuple[Dict, float]]:
         if not query.strip() or query_emb.size == 0:
             return []
+
         norms = np.linalg.norm(query_emb, axis=1, keepdims=True)
         vector = (query_emb / (norms + 1e-9))[0].tolist()
         bool_query = {
@@ -2075,6 +2076,14 @@ Examples:
 12. Query: "Look up ICD-10 code I21." Intent: KEYWORD
 13. Query: "Fetch records of patient with name Mary Johnson or number 456 or address 123 Main St." Intent: ENTITY_SPECIFIC
 14. Query: "Fetch me the details of patients with heart problems." Intent: HYBRID
+15. Query: "What is the status of the medication request for patient 789?" Intent: EXPLANATORY
+16. Query: "Get the latest lab results for patient 101." Intent: DOCUMENT_FETCH
+17. Query: "How many patients were treated in the last month?" Intent: AGGREGATE
+18. Query: "Compare the lab results of patient 202 and patient 303." Intent: COMPARISON
+19. Query: "Show me the trends in cholesterol levels for patient 404 over the last year." Intent: TEMPORAL
+20. Query: "Get me the details of the procedure performed on patient 505." Intent: ENTITY_SPECIFIC
+21. Query: "Get me the document for Julian140" Intent: DOCUMENT_FETCH
+22. Query: "Get me the document for Julian140 and the procedure code 99213" Intent: MULTI_INTENT
 """
 
 
