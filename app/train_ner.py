@@ -71,7 +71,7 @@ def load_synthea_data(directory_path):
     if not json_files:
         print(f"No JSON files found in {directory_path}. Using fallback data.")
         return [{"entry": []}]  # Fallback empty data
-    
+
     for json_file in json_files:
         try:
             with open(json_file, "r") as f:
@@ -306,26 +306,68 @@ def generate_ner_data(directory_path, n_samples=2000):
     doctors = generate_doctor_names(500)
 
     templates = [
-        "Get details for patient {}.",
-        "Find patients with {}.",
-        "Patient {} had {} on {}.",
-        "Consult with {} about {}.",
-        "Prescribe {} for {}.",
-        "Perform {} on {}.",
-        "Order {} for {}.",
+        # Person‑centric
+        "Show all notes for patient {}.",
+        "Open the chart of {}.",
+        "Pull vitals recorded for {} yesterday.",
+        "When was {}'s last appointment?",
+        "Has {} had any recent lab work?",
+        "Summarize the history of {} in one paragraph.",
+        # Condition / ICD‑10
+        "List every patient diagnosed with {}.",
+        "How many encounters were coded as {}?",
+        "Any active cases of {} since {}?",
+        "Flag patients where {} appears in the assessment.",
+        "{} (ICD‑10 {}) — give prevalence by gender.",
+        # Medication
+        "Who is currently taking {}?",
+        "Discontinue {} for {} effective {}.",
+        "Renew {} prescription for {}.",
+        "What is the dosage of {} prescribed to {}?",
+        # Procedure / CPT
+        "Schedule a follow‑up {} for {} next week.",
+        "Did {} undergo {} this year?",
+        "Lookup CPT {} billed for {}.",
+        "{} had a {} on {} — add it to the problem list.",
+        # Lab / LOINC
+        "Order a {} for {} immediately.",
+        "Graph the last five {} results for {}.",
+        "What LOINC code corresponds to {}?",
+        "Attach {} result value to {}'s record.",
+        # Anatomy / Observation value
         "Check {} function in {}.",
-        "Record {} as {}.",
-        "Diagnose {} with code {}.",
-        "Bill procedure code {} for {}.",
-        "Lab test code {} ordered for {}.",
-        "Schedule appointment on {} for {}.",
-        "Patient is {}.",
-        "Contact {} at {}.",
-        "Email {} about appointment.",
-        "Patient lives at {}.",
-        "Refer {} to {}.",
-        "{} condition is {}.",
+        "Record {} as {} in vitals.",
+        "Is {} greater than the normal range for {}?",
+        # Doctor & organization
+        "Consult with {} about {}.",
+        "Which doctor is following up on {}'s {}?",
+        "Refer {} to {} for second opinion.",
+        "Route discharge summary to {}.",
+        # Date / appointment
+        "Book {} for {} on {}.",
+        "Reschedule {}’s visit from {} to {}.",
+        "Anything scheduled on {} for {}?",
+        # Gender / demographics
+        "Filter records where gender is {}.",
+        "Patient is {} — adjust dosage recommendations.",
+        # Contact info
+        "Contact {} at {} regarding lab results.",
+        "Send email to {} confirming appointment.",
+        "Patient lives at {} — map the distance.",
+        # Allergy / severity
         "Patient allergic to {}.",
+        "Mark {} as {} severity.",
+        "Any {} reactions recorded for {}?",
+        # Mixed questions
+        "Has {} been prescribed {} since {}?",
+        "Give me the latest {} reading (LOINC {}) for {}.",
+        "Add procedure code {} to {}’s upcoming visit.",
+        "What medications interact with {} for {}?",
+        # Short imperative / query forms
+        "labs {} {}",
+        "meds {} {}",
+        "dx {} {}",
+        "rx {} {}",
     ]
     data = []
     for _ in range(n_samples):
