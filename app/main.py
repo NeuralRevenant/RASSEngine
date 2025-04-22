@@ -1,3 +1,6 @@
+# RASS Engine - Retrieval Augmented Semantic Search
+
+
 import os
 from dotenv import load_dotenv
 import json
@@ -26,11 +29,16 @@ from fastapi import (
 from opensearchpy import OpenSearch, RequestsHttpConnection
 from opensearchpy.helpers import bulk
 
+# from transformers import (
+#     AutoModelForSequenceClassification,
+#     AutoTokenizer,
+#     BertForTokenClassification,
+#     BertTokenizerFast,
+# )
 from transformers import (
     AutoModelForSequenceClassification,
+    AutoModelForTokenClassification,
     AutoTokenizer,
-    BertForTokenClassification,
-    BertTokenizerFast,
 )
 import torch
 from datetime import datetime, timezone
@@ -105,23 +113,55 @@ db = Prisma()  # prisma client init
 # ==============================================================================
 # Load Trained Models
 # ==============================================================================
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-logger.info(f"Using device: {device}")
+
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+    torch.set_float32_matmul_precision("high")  # enables TF32 on Ampere/Hopper
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")  # Apple‑Silicon GPU
+else:
+    device = torch.device("cpu")
+
+logger.info(f"➡️  Running on: {device}")
+
+NER_MODEL_NAME = os.getenv("NER_MODEL_NAME", "dslim/bert-base-NER")
+INTENT_MODEL_NAME = os.getenv(
+    "INTENT_MODEL_NAME", "MoritzLaurer/deberta-v3-base-mnli"
+)  # strong zero‑shot
+
 
 try:
-    ner_model = BertForTokenClassification.from_pretrained(NER_MODEL_PATH).to(device)
-    ner_tokenizer = BertTokenizerFast.from_pretrained(NER_MODEL_PATH)
-    logger.info(f"Loaded NER model from {NER_MODEL_PATH}")
+    # ner_model = BertForTokenClassification.from_pretrained(NER_MODEL_PATH).to(device)
+    # ner_tokenizer = BertTokenizerFast.from_pretrained(NER_MODEL_PATH)
+    ner_model = AutoModelForTokenClassification.from_pretrained(NER_MODEL_NAME).to(
+        device
+    )
+    ner_tokenizer = AutoTokenizer.from_pretrained(NER_MODEL_NAME, use_fast=True)
+
+    if hasattr(torch, "compile") and device.type == "cuda":
+        ner_model = torch.compile(ner_model)
+
+    logger.info(f"Loaded NER model: {NER_MODEL_NAME}")
 except Exception as e:
     logger.error(f"Failed to load NER model: {e}")
     raise
 
 try:
+    # intent_model = AutoModelForSequenceClassification.from_pretrained(
+    #     INTENT_MODEL_PATH
+    # ).to(device)
+    # intent_tokenizer = AutoTokenizer.from_pretrained(INTENT_MODEL_PATH)
+
     intent_model = AutoModelForSequenceClassification.from_pretrained(
-        INTENT_MODEL_PATH
+        INTENT_MODEL_NAME
     ).to(device)
-    intent_tokenizer = AutoTokenizer.from_pretrained(INTENT_MODEL_PATH)
-    logger.info(f"Loaded intent model from {INTENT_MODEL_PATH}")
+    intent_tokenizer = AutoTokenizer.from_pretrained(INTENT_MODEL_NAME, use_fast=True)
+
+    if hasattr(torch, "compile") and device.type == "cuda":
+        intent_model = torch.compile(intent_model)
+
+    logger.info(f"Loaded intent model: {INTENT_MODEL_NAME}")
+    # logger.info(f"Loaded intent model from {INTENT_MODEL_PATH}")
 except Exception as e:
     logger.error(f"Failed to load intent model: {e}")
     raise
@@ -2045,13 +2085,6 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
     return chunks
 
 
-# Initialize the model pipeline
-intent_classifier = pipeline(
-    "zero-shot-classification",
-    model=QUERY_INTENT_CLASSIFICATION_MODEL,
-    device=0 if torch.cuda.is_available() else -1,
-)
-
 # Intent categories
 INTENT_CATEGORIES = [
     "SEMANTIC",
@@ -2105,8 +2138,9 @@ def ner_preprocess(query: str) -> Optional[Dict]:
     inputs = ner_tokenizer(
         query, return_tensors="pt", truncation=True, padding=True, max_length=128
     ).to(device)
-    with torch.no_grad():
+    with torch.inference_mode():
         outputs = ner_model(**inputs)
+
     logits = outputs.logits
     predictions = torch.argmax(logits, dim=-1)[0].cpu().numpy()
     tokens = ner_tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
@@ -2170,7 +2204,7 @@ def classify_intent(query: str) -> str:
     inputs = intent_tokenizer(
         query, return_tensors="pt", truncation=True, padding=True, max_length=128
     ).to(device)
-    with torch.no_grad():
+    with torch.inference_mode():
         outputs = intent_model(**inputs)
 
     logits = outputs.logits
@@ -2353,7 +2387,7 @@ async def ask(
         "You are a helpful medical AI assistant chatbot with access to FHIR-based, markdown, and plain-text EHR data. You must follow these rules and provide accurate and professional answers based on the query and context:\n"
         "1) Always cite document IDs from the context exactly as 'Document XYZ' without any file extensions like '.txt'.\n"
         "2) For every answer generated, there should be a reference or citation of the IDs of the documents from which the answer information was extracted at the end of the answer!\n"
-        "3) If the context does not relate to the query, say 'I lack the context to answer your question.' For example, if the query is about gene mutations but the context is about climate change, acknowledge the mismatch and do not answer.\n"
+        "3) If the context does not relate to the query, say something like 'I lack the context to answer your question.' For example, if the query is about gene mutations but the context is about climate change, acknowledge the mismatch and do not answer.\n"
         "4) Never ever give responses based on your own knowledge of the user query. Use ONLY the provided context + chat history to extract information relevant to the question. You should not answer without document ID references from which the information was extracted.\n"
         "5) If you lack context, then say so.\n"
         "6) Do not add chain-of-thought.\n"
