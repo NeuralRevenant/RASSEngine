@@ -124,9 +124,11 @@ else:
 
 logger.info(f"➡️  Running on: {device}")
 
-NER_MODEL_NAME = os.getenv("NER_MODEL_NAME", "dslim/bert-base-NER")
+NER_MODEL_NAME = os.getenv("NER_MODEL_NAME", "Jean-Baptiste/roberta-large-ner-english")
 INTENT_MODEL_NAME = os.getenv(
-    "INTENT_MODEL_NAME", "MoritzLaurer/deberta-v3-base-mnli"
+    "INTENT_MODEL_NAME",
+    "facebook/bart-large-mnli",
+    # "MoritzLaurer/deberta-v3-base-mnli"
 )  # strong zero‑shot
 
 
@@ -162,6 +164,15 @@ try:
 
     logger.info(f"Loaded intent model: {INTENT_MODEL_NAME}")
     # logger.info(f"Loaded intent model from {INTENT_MODEL_PATH}")
+
+    # from transformers import pipeline
+
+    # intent_classifier = pipeline(
+    #     "zero-shot-classification",
+    #     model="facebook/bart-large-mnli",
+    #     # device=0 if torch.cuda.is_available() else -1,
+    #     device=-1
+    # )
 except Exception as e:
     logger.error(f"Failed to load intent model: {e}")
     raise
@@ -1145,7 +1156,7 @@ def infer_patient_id_from_filename(filename: str) -> Optional[str]:
 def parse_text_file(file_path: str, file_type: str) -> Tuple[List[Dict], List[Dict]]:
     structured_docs = []
     unstructured_docs = []
-    emb_dir = Path(UPLOAD_DIR).resolve()
+    emb_dir = Path(EMB_DIR).resolve()
     absolute_path = Path(file_path).resolve()
     try:
         relative_file_path = str(absolute_path.relative_to(emb_dir))
@@ -1347,7 +1358,7 @@ def validate_file_path(
 
 
 async def retrieve_ehr_document(file_path: str) -> Optional[Dict]:
-    valid_path = validate_file_path(file_path, base_dir=EMB_DIR, read=True)
+    valid_path = validate_file_path(file_path, base_dir=UPLOAD_DIR, read=True)
     if not valid_path:
         logger.error(f"Cannot retrieve EHR document: {file_path}")
         return None
@@ -1601,47 +1612,78 @@ class OpenSearchIndexer:
     ) -> List[Tuple[Dict, float]]:
         if not query.strip():
             return []
-        structured_fields = [
-            "patientName^3",
-            "patientGender^3",
-            "patientDOB",
-            "patientTelecom^3",
-            "conditionCodeText^2",
-            "conditionClinicalStatus",
-            "conditionSeverity",
-            "observationCodeText",
-            "observationValue",
-            "observationUnit",
-            "encounterStatus",
-            "encounterClass",
-            "medRequestMedicationDisplay",
-            "medRequestStatus",
-            "procedureCodeText",
-            "procedureStatus",
-            "allergyCodeText",
-            "allergyClinicalStatus",
-            "practitionerName^3",
-            "organizationName^3",
+        # structured_fields = [
+        #     "patientName^3",
+        #     "patientGender^3",
+        #     "patientDOB",
+        #     "patientTelecom^3",
+        #     "conditionCodeText^2",
+        #     "conditionClinicalStatus",
+        #     "conditionSeverity",
+        #     "observationCodeText",
+        #     "observationValue",
+        #     "observationUnit",
+        #     "encounterStatus",
+        #     "encounterClass",
+        #     "medRequestMedicationDisplay",
+        #     "medRequestStatus",
+        #     "procedureCodeText",
+        #     "procedureStatus",
+        #     "allergyCodeText",
+        #     "allergyClinicalStatus",
+        #     "practitionerName^3",
+        #     "organizationName^3",
+        # ]
+        structured_text_fields = [
+            f for f in structured_fields if not f.endswith(".keyword")
         ]
-        bool_query = {
-            "must": [
+        structured_keyword_fields = [
+            f for f in structured_fields if f.endswith(".keyword")
+        ]
+
+        must_clauses = []
+        # bool_query = {
+        #     "must": [
+        #         {
+        #             "multi_match": {
+        #                 "query": query,
+        #                 "fields": structured_fields,
+        #                 "type": "phrase_prefix",
+        #                 "operator": "and",
+        #             }
+        #         }
+        #     ],
+        #     "filter": [{"term": {"doc_type": "structured"}}],
+        # }
+        # if filter_clause or patient_id:
+        #     bool_query["filter"] = []
+        #     if filter_clause:
+        #         bool_query["filter"].append(filter_clause)
+        #     if patient_id:
+        #         bool_query["filter"].append({"term": {"patientId": patient_id}})
+
+        if structured_text_fields:
+            must_clauses.append(
                 {
                     "multi_match": {
                         "query": query,
-                        "fields": structured_fields,
+                        "fields": structured_text_fields,
                         "type": "phrase_prefix",
                         "operator": "and",
                     }
                 }
-            ]
+            )
+
+        if structured_keyword_fields:
+            for field in structured_keyword_fields:
+                must_clauses.append(
+                    {"match": {field: {"query": query, "operator": "and"}}}
+                )
+
+        bool_query = {
+            "must": must_clauses,
+            "filter": [{"term": {"doc_type": "structured"}}],
         }
-        if filter_clause or patient_id:
-            bool_query["filter"] = []
-            if filter_clause:
-                bool_query["filter"].append(filter_clause)
-            if patient_id:
-                bool_query["filter"].append({"term": {"patientId": patient_id}})
-        bool_query["filter"].append({"term": {"doc_type": "structured"}})
         query_body = {"size": k, "query": {"bool": bool_query}, "terminate_after": k}
         try:
             resp = self.client.search(
@@ -2020,6 +2062,50 @@ class OpenSearchIndexer:
             logger.error(f"Entity-specific search error: {e}")
             return []
 
+    # def document_fetch_search(
+    #     self,
+    #     query: str,
+    #     k: int = TOP_K,
+    #     filter_clause: Optional[Dict] = None,
+    #     patient_id: Optional[str] = None,
+    # ) -> List[Tuple[Dict, float]]:
+    #     if not query.strip():
+    #         return []
+    #     bool_query = {
+    #         "must": [
+    #             {
+    #                 "multi_match": {
+    #                     "query": query,
+    #                     "fields": ["patientId^4", "file_path^3"],
+    #                     "type": "phrase",
+    #                 }
+    #             }
+    #         ]
+    #     }
+    #     if filter_clause or patient_id:
+    #         bool_query["filter"] = []
+    #         if filter_clause:
+    #             bool_query["filter"].append(filter_clause)
+    #         if patient_id:
+    #             bool_query["filter"].append({"term": {"patientId": patient_id}})
+
+    #     query_body = {
+    #         "size": k,
+    #         "query": {"bool": bool_query},
+    #         "collapse": {"field": "patientId"},
+    #         "terminate_after": k,
+    #     }
+    #     try:
+    #         resp = self.client.search(
+    #             index=self.index_name, body=query_body, routing=patient_id
+    #         )
+    #         return [
+    #             (hit["_source"], float(hit["_score"])) for hit in resp["hits"]["hits"]
+    #         ]
+    #     except Exception as e:
+    #         logger.error(f"Document fetch search error: {e}")
+    #         return []
+
     def document_fetch_search(
         self,
         query: str,
@@ -2027,25 +2113,12 @@ class OpenSearchIndexer:
         filter_clause: Optional[Dict] = None,
         patient_id: Optional[str] = None,
     ) -> List[Tuple[Dict, float]]:
-        if not query.strip():
+        if not patient_id:
             return []
-        bool_query = {
-            "must": [
-                {
-                    "multi_match": {
-                        "query": query,
-                        "fields": ["patientId^4", "file_path^3"],
-                        "type": "phrase",
-                    }
-                }
-            ]
-        }
-        if filter_clause or patient_id:
-            bool_query["filter"] = []
-            if filter_clause:
-                bool_query["filter"].append(filter_clause)
-            if patient_id:
-                bool_query["filter"].append({"term": {"patientId": patient_id}})
+
+        bool_query = {"filter": [{"term": {"patientId": patient_id}}]}
+        if filter_clause:
+            bool_query["filter"].append(filter_clause)
 
         query_body = {
             "size": k,
@@ -2053,6 +2126,7 @@ class OpenSearchIndexer:
             "collapse": {"field": "patientId"},
             "terminate_after": k,
         }
+
         try:
             resp = self.client.search(
                 index=self.index_name, body=query_body, routing=patient_id
@@ -2102,32 +2176,75 @@ INTENT_CATEGORIES = [
 ]
 
 # Few-shot examples embedded in the classifier prompt
+# FEW_SHOT_EXAMPLES = """
+# Classify the query into one of these intents: SEMANTIC, KEYWORD, HYBRID, STRUCTURED, HYBRID_STRUCTURED, AGGREGATE, COMPARISON, TEMPORAL, EXPLANATORY, MULTI_INTENT, ENTITY_SPECIFIC, DOCUMENT_FETCH.
+
+# Examples:
+# 1. Query: "What are the symptoms of diabetes?" Intent: EXPLANATORY
+# 2. Query: "Fetch the medical records for patient John Doe." Intent: DOCUMENT_FETCH
+# 3. Query: "How many patients have hypertension?" Intent: AGGREGATE
+# 4. Query: "Compare the outcomes of heart surgery vs. medication." Intent: COMPARISON
+# 5. Query: "Show me trends in blood pressure for patient 123 over time." Intent: TEMPORAL
+# 6. Query: "Find patients with heart disease." Intent: HYBRID
+# 7. Query: "Get details for patient Jane Smith." Intent: ENTITY_SPECIFIC
+# 8. Query: "Search for diabetes treatment options." Intent: SEMANTIC
+# 9. Query: "List all procedures with CPT code 99213." Intent: STRUCTURED
+# 10. Query: "Find patients with both asthma and allergies." Intent: HYBRID_STRUCTURED
+# 11. Query: "Explain the procedure for knee replacement and list patients who had it." Intent: MULTI_INTENT
+# 12. Query: "Look up ICD-10 code I21." Intent: KEYWORD
+# 13. Query: "Fetch records of patient with name Mary Johnson or number 456 or address 123 Main St." Intent: ENTITY_SPECIFIC
+# 14. Query: "Fetch me the details of patients with heart problems." Intent: HYBRID
+# 15. Query: "What is the status of the medication request for patient 789?" Intent: EXPLANATORY
+# 16. Query: "Get the latest lab results for patient 101." Intent: DOCUMENT_FETCH
+# 17. Query: "How many patients were treated in the last month?" Intent: AGGREGATE
+# 18. Query: "Compare the lab results of patient 202 and patient 303." Intent: COMPARISON
+# 19. Query: "Show me the trends in cholesterol levels for patient 404 over the last year." Intent: TEMPORAL
+# 20. Query: "Get me the details of the procedure performed on patient 505." Intent: ENTITY_SPECIFIC
+# 21. Query: "Get me the document for Julian140" Intent: DOCUMENT_FETCH
+# 22. Query: "Get me the document for Julian140 and the procedure code 99213" Intent: MULTI_INTENT
+# """
+
 FEW_SHOT_EXAMPLES = """
 Classify the query into one of these intents: SEMANTIC, KEYWORD, HYBRID, STRUCTURED, HYBRID_STRUCTURED, AGGREGATE, COMPARISON, TEMPORAL, EXPLANATORY, MULTI_INTENT, ENTITY_SPECIFIC, DOCUMENT_FETCH.
 
 Examples:
 1. Query: "What are the symptoms of diabetes?" Intent: EXPLANATORY
-2. Query: "Fetch the medical records for patient John Doe." Intent: DOCUMENT_FETCH
-3. Query: "How many patients have hypertension?" Intent: AGGREGATE
-4. Query: "Compare the outcomes of heart surgery vs. medication." Intent: COMPARISON
-5. Query: "Show me trends in blood pressure for patient 123 over time." Intent: TEMPORAL
-6. Query: "Find patients with heart disease." Intent: HYBRID
-7. Query: "Get details for patient Jane Smith." Intent: ENTITY_SPECIFIC
-8. Query: "Search for diabetes treatment options." Intent: SEMANTIC
-9. Query: "List all procedures with CPT code 99213." Intent: STRUCTURED
-10. Query: "Find patients with both asthma and allergies." Intent: HYBRID_STRUCTURED
-11. Query: "Explain the procedure for knee replacement and list patients who had it." Intent: MULTI_INTENT
-12. Query: "Look up ICD-10 code I21." Intent: KEYWORD
-13. Query: "Fetch records of patient with name Mary Johnson or number 456 or address 123 Main St." Intent: ENTITY_SPECIFIC
+2. Query: "What is the status of the medication request for patient 789?" Intent: EXPLANATORY
+
+3. Query: "Fetch the medical records for patient John Doe." Intent: DOCUMENT_FETCH
+4. Query: "Get the latest lab results for patient 101." Intent: DOCUMENT_FETCH
+5. Query: "Get me the document for Julian140" Intent: DOCUMENT_FETCH
+6. Query: "Fetch records of patient with name Mary Johnson or number 456 or address 123 Main St." Intent: DOCUMENT_FETCH
+
+7. Query: "How many patients have hypertension?" Intent: AGGREGATE
+8. Query: "How many patients were treated in the last month?" Intent: AGGREGATE
+
+9. Query: "Compare the outcomes of heart surgery vs. medication." Intent: COMPARISON
+10. Query: "Compare the lab results of patient 202 and patient 303." Intent: COMPARISON
+
+11. Query: "Show me trends in blood pressure for patient 123 over time." Intent: TEMPORAL
+12. Query: "Show me the trends in cholesterol levels for patient 404 over the last year." Intent: TEMPORAL
+
+13. Query: "Find patients with heart disease." Intent: HYBRID
 14. Query: "Fetch me the details of patients with heart problems." Intent: HYBRID
-15. Query: "What is the status of the medication request for patient 789?" Intent: EXPLANATORY
-16. Query: "Get the latest lab results for patient 101." Intent: DOCUMENT_FETCH
-17. Query: "How many patients were treated in the last month?" Intent: AGGREGATE
-18. Query: "Compare the lab results of patient 202 and patient 303." Intent: COMPARISON
-19. Query: "Show me the trends in cholesterol levels for patient 404 over the last year." Intent: TEMPORAL
-20. Query: "Get me the details of the procedure performed on patient 505." Intent: ENTITY_SPECIFIC
-21. Query: "Get me the document for Julian140" Intent: DOCUMENT_FETCH
-22. Query: "Get me the document for Julian140 and the procedure code 99213" Intent: MULTI_INTENT
+
+15. Query: "Get details for patient Jane Smith." Intent: ENTITY_SPECIFIC
+16. Query: "Get me the details of the procedure performed on patient 505." Intent: ENTITY_SPECIFIC
+
+17. Query: "Search for diabetes treatment options." Intent: SEMANTIC
+18. Query: "Tell me about asthma and how it’s treated." Intent: SEMANTIC
+
+19. Query: "List all procedures with CPT code 99213." Intent: STRUCTURED
+20. Query: "Give me all patients with ICD-10 code E11." Intent: STRUCTURED
+
+21. Query: "Find patients with both asthma and allergies." Intent: HYBRID_STRUCTURED
+22. Query: "Search for female patients over 50 with diabetes and high blood pressure." Intent: HYBRID_STRUCTURED
+
+23. Query: "Explain the procedure for knee replacement and list patients who had it." Intent: MULTI_INTENT
+24. Query: "Get me the document for Julian140 and the procedure code 99213" Intent: MULTI_INTENT
+
+25. Query: "Look up ICD-10 code I21." Intent: KEYWORD
+26. Query: "Search for CPT 90792." Intent: KEYWORD
 """
 
 
@@ -2200,24 +2317,126 @@ def ner_preprocess(query: str) -> Optional[Dict]:
     return {"bool": {"must": must_filters}} if must_filters else None
 
 
+# def classify_intent(query: str) -> str:
+#     inputs = intent_tokenizer(
+#         query, return_tensors="pt", truncation=True, padding=True, max_length=128
+#     ).to(device)
+#     with torch.inference_mode():
+#         outputs = intent_model(**inputs)
+
+#     logits = outputs.logits
+#     predicted_id = torch.argmax(logits, dim=-1).item()
+#     try:
+#         intent = intent_model.config.id2label[predicted_id].upper()
+#         if intent not in INTENT_CATEGORIES:
+#             logger.warning(f"Invalid intent '{intent}', falling back to HYBRID")
+#             return "HYBRID"
+#         return intent
+#     except KeyError:
+#         logger.error("Intent ID not found in id2label, falling back to HYBRID")
+#         return "HYBRID"
+
+
 def classify_intent(query: str) -> str:
+    # Prepare premise and label hypotheses
+    label_hypotheses = [
+        f"This example is about {label.lower().replace('_', ' ')}."
+        for label in INTENT_CATEGORIES
+    ]
+
     inputs = intent_tokenizer(
-        query, return_tensors="pt", truncation=True, padding=True, max_length=128
+        [query] * len(label_hypotheses),
+        label_hypotheses,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
     ).to(device)
+
     with torch.inference_mode():
         outputs = intent_model(**inputs)
 
+    # For BART-style NLI models, class 2 = "entailment", which we want
+    entail_logits = outputs.logits[:, 2]
+    best_label_id = torch.argmax(entail_logits).item()
+    return INTENT_CATEGORIES[best_label_id]
+
+
+# def classify_intent(query: str) -> str:
+#     try:
+#         # Construct full prompt using few-shot context
+#         full_prompt = FEW_SHOT_EXAMPLES + f'\n\nQuery: "{query}" → Intent:'
+
+#         result = intent_classifier(
+#             full_prompt, candidate_labels=INTENT_CATEGORIES, multi_label=False
+#         )
+#         top_label = result["labels"][0].upper()
+
+#         if top_label not in INTENT_CATEGORIES:
+#             logger.warning(f"Invalid intent '{top_label}', falling back to HYBRID")
+#             return "HYBRID"
+
+#         return top_label
+#     except Exception as e:
+#         logger.error(f"Intent classification failed: {e}, falling back to HYBRID")
+#         return "HYBRID"
+
+
+def extract_patient_id(query: str) -> Optional[str]:
+    # First, try NER-based extraction
+    inputs = ner_tokenizer(
+        query, return_tensors="pt", truncation=True, padding=True, max_length=128
+    ).to(device)
+    with torch.inference_mode():
+        outputs = ner_model(**inputs)
+
     logits = outputs.logits
-    predicted_id = torch.argmax(logits, dim=-1).item()
+    predictions = torch.argmax(logits, dim=-1)[0].cpu().numpy()
+    tokens = ner_tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
+    id2label = ner_model.config.id2label
+
+    patient_tokens = []
+    for token, pred_id in zip(tokens, predictions):
+        label = id2label[pred_id]
+        if label == "B-PATIENT" or label == "I-PATIENT":
+            patient_tokens.append(token.replace("##", ""))
+
+    if patient_tokens:
+        return "".join(patient_tokens)
+
+    # Fallback to regex-based ID extraction like "Julian140"
+    match = re.search(r"(Julian\d+)", query, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+async def resolve_patient_id_from_name(
+    query: str,
+    client: OpenSearch,
+    index_name: str,
+) -> Optional[str]:
+    match = re.search(r"\b(Julian\d+)\b", query, re.IGNORECASE)
+    if not match:
+        return None
+
+    patient_name_candidate = match.group(1)
+    query_body = {
+        "size": 1,
+        "_source": ["patientId", "patientName"],
+        "query": {"match_phrase": {"patientName": patient_name_candidate}},
+    }
+
     try:
-        intent = intent_model.config.id2label[predicted_id].upper()
-        if intent not in INTENT_CATEGORIES:
-            logger.warning(f"Invalid intent '{intent}', falling back to HYBRID")
-            return "HYBRID"
-        return intent
-    except KeyError:
-        logger.error("Intent ID not found in id2label, falling back to HYBRID")
-        return "HYBRID"
+        resp = client.search(index=index_name, body=query_body)
+        hits = resp.get("hits", {}).get("hits", [])
+        if hits:
+            resolved_id = hits[0]["_source"].get("patientId")
+            logger.info(
+                f"Resolved '{patient_name_candidate}' to patientId: {resolved_id}"
+            )
+            return resolved_id
+    except Exception as e:
+        logger.error(f"Patient ID resolution failed: {e}")
+
+    return None
 
 
 # ==============================================================================
@@ -2245,7 +2464,11 @@ async def ask(
     #  apply NER and intent classification
     filter_clause = ner_preprocess(query)
     intent = classify_intent(query)
-    patient_id = infer_patient_id_from_filename(query) or None
+    # patient_id = infer_patient_id_from_filename(query) or None
+
+    index_name = get_index_name(user_id)
+    patient_id = await resolve_patient_id_from_name(query, os_client, index_name)
+
     logger.info(
         f"Intent: {intent}, Filter Clause: {filter_clause}, Patient ID: {patient_id}"
     )
@@ -2266,7 +2489,6 @@ async def ask(
         chat_history_str += f"{role_label}: {m.content}\n"
 
     query_emb = await embed_query(query)
-    index_name = get_index_name(user_id)
     await ensure_index_exists(os_client, index_name)
     os_indexer = OpenSearchIndexer(os_client, index_name)
 
@@ -2554,7 +2776,10 @@ async def ask_websocket_endpoint(websocket: WebSocket):
         # apply NER and intent classification
         filter_clause = ner_preprocess(query)
         intent = classify_intent(query)
-        patient_id = infer_patient_id_from_filename(query) or None
+        # patient_id = infer_patient_id_from_filename(query) or None
+
+        index_name = get_index_name(user_id)
+        patient_id = await resolve_patient_id_from_name(query, os_client, index_name)
         logger.info(
             f"[WebSocket Debug] Intent: {intent}, Filter Clause: {filter_clause}, Patient ID: {patient_id}"
         )
@@ -2573,7 +2798,6 @@ async def ask_websocket_endpoint(websocket: WebSocket):
             chat_history_str += f"{role_label}: {m.content}\n"
 
         query_emb = await embed_query(query)
-        index_name = get_index_name(user_id)
         await ensure_index_exists(os_client, index_name)
         os_indexer = OpenSearchIndexer(os_client, index_name)
 
