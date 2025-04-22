@@ -1,7 +1,8 @@
 # **RASS Engine: Natural Language Search over EHR / Medical Documents**
 
-🚀 A **Retrieval-Augmented Semantic Search (RASS)** system designed to support **natural language querying** on large-scale medical and EHR documents.  
-🔍 Built for **fast, intelligent, and accurate retrieval** with semantic understanding, contextual responses, and caching support.
+🚀 A **Retrieval-Augmented Semantic Search (RASS)** system designed to support **natural language** or **conversational querying** on clinical and EHR documents using hybrid neural search.
+
+🔍 Built for **fast, intelligent, and accurate retrieval** with semantic understanding, contextual responses, and access to structured and unstructured data.
 
 ---
 
@@ -84,22 +85,14 @@ flowchart TD
 ## 🔑 Key Features
 
 - ✅ **Natural language interface** using REST & WebSocket endpoints.
-- 🧠 **Zero-shot classifier** (via HuggingFace model) determines:
-  - `SEMANTIC` (vector search),
-  - `KEYWORD` (text search),
-  - or `HYBRID` (combined).
-- 🧬 **Embedding model configurable** via `.env` (Ollama API integration):
-  ```env
-  OLLAMA_EMBED_MODEL=mxbai-embed-large:latest
-  ```
-- 📦 **Dedicated FHIR & text ingestion flow**:
+- 🧠 **Zero-shot intent classifier** (via HuggingFace model) determines: SEMANTIC, KEYWORD, HYBRID, STRUCTURED, etc.
+- 🧠 **Named Entity Recognition** via HF model identifies the named entities for better retrieval and generation.
+- 🧬 **Dynamic embedding model selection** via .env (Ollama API)
+- 📂 **Upload flow** supports .json, .txt, .md files
+- 🧩 **FHIR parsing, adaptive chunking, and embedding**
   - From Upload Service or RASS Engine.
   - Automatically parsed, chunked, embedded, and stored in OpenSearch.
-- 🔁 **Caching**:
-  - LFU-style query cache in Redis with embedding-based similarity.
-- 🔎 **Retrieval engine**:
-  - OpenSearch HNSW for ANN.
-  - Text-based multi-match queries for full-text relevance.
+- 🔎 **OpenSearch HNSW-based hybrid retrieval**
 - 📘 **Citation-enforced LLM generation** using BlueHive or OpenAI GPT-4o.
 - 🔧 **.env-controlled architecture** – zero hardcoding.
 
