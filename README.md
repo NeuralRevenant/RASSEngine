@@ -16,64 +16,67 @@
 
 ```mermaid
 flowchart TD
-  subgraph User["🧑 User
-Microservices Layer"]
-    UQ["Query via REST or WebSocket"]
-    UF["Upload FHIR / TXT Files"]
+  %% Users
+  subgraph User["User"]
+    UQ["Query via REST (/ask)"]
+    UWS["Query via WebSocket (/ws/ask)"]
+    UPL["Upload FHIR/TXT Files"]
   end
 
-  subgraph UploadService["📂 File Upload Service"]
-    F1["Accept File (FHIR/Plain-Text)"]
-    F2["Store File to Disk"]
-    F3["Call FHIR Parser & Indexer"]
+  %% RASS Engine (Query Microservice)
+  subgraph RASSEngine["RASS Engine (port 8000)"]
+    A1["Receive Query"]
+    A2["NER Preprocessing"]
+    A3["Intent Classification"]
+    A4["Fetch Chat History (Prisma)"]
+    A5["embed_query()"]
+    A6["ensure_index_exists()"]
+    A7["Search (OpenSearchIndexer)"]
+    A8["bluehive_generate_text()"]
+    A9["Store Q&A (Prisma)"]
   end
 
-  subgraph FastAPI["🧠 RASS Engine (FastAPI)"]
-    A1["Intent Classification (Zero-shot)"]
-    A2["Cache Lookup (Redis LFU)"]
-    A3["Retriever (Hybrid/Keyword/Semantic)"]
-    A4["Answer Generation (BlueHive AI)"]
-    A5["Cache Response + Save Chat"]
-    A6["Call FHIR Parser & Indexer"]
+  %% Embedding Service (File Ingestion)
+  subgraph EmbeddingService["Embedding Service (port 8001)"]
+    B1["POST /upload_data"]
+    B2["Validate User & Files"]
+    B3["Parse FHIR/Markdown/Text"]
+    B4["chunk_text()"]
+    B5["embed_texts_in_batches()"]
+    B6["ensure_index_exists()"]
+    B7["Bulk Index to OpenSearch"]
   end
 
-  subgraph Embedding["🧬 Embedding Model (via Ollama)"]
-    B1["Env-driven model (e.g. mxbai-embed-large, jina-embed, etc.)"]
+  %% External APIs & DBs
+  subgraph Ollama["Ollama Embedding API"]
+    OL["/embeddings"]
   end
 
-  subgraph OpenSearch["🔎 OpenSearch"]
-    C1["HNSW Vector Search"]
-    C2["Text Fields (FHIR / Narrative)"]
+  subgraph OpenSearch["OpenSearch"]
+    OS["Vector Index"]
   end
 
-  subgraph Redis["⚡ Redis"]
-    D1["LFU Caching of (Embedding, Answer)"]
+  subgraph BlueHive["BlueHive LLM API"]
+    BH["generate_text"]
   end
 
-  subgraph BlueHive["🤖 BlueHive / LLM"]
-    E1["LLM-based Contextual Answer Generation"]
+  subgraph Prisma["Prisma / PostgreSQL"]
+    DB["Database"]
   end
 
-  subgraph FHIRParser["🧩 FHIR Parser & Indexer"]
-    P1["Parse + Chunk + Embed"]
-    P2["Store in OpenSearch"]
-  end
+  %% Query flow
+  UQ --> A1
+  UWS --> A1
+  A1 --> A2 --> A3 --> A4
+  A4 --> DB
+  A4 --> A5 --> OL --> A6 --> OS
+  A6 --> A7 --> OS
+  A7 --> A8 --> BH --> A9 --> DB
 
-  %% Query Flow
-  UQ --> A1 --> A2
-  A2 -->|Cache Hit| A5
-  A2 -->|Cache Miss| A3
-  A3 --> C1 & C2
-  A3 --> B1
-  A3 --> A4 --> E1
-  A4 --> A5 --> D1
-
-  %% Upload Flow
-  UF --> F1 --> F2 --> F3 --> P1 --> B1
-  P1 --> P2 --> C2 & C1
-
-  %% Ingestion Triggered from RASS
-  A6 --> P1
+  %% Ingestion flow
+  UPL --> B1 --> B2 --> B3 --> B4 --> B5 --> OL
+  OL --> B6 --> OS
+  B6 --> B7 --> OS
 ```
 
 ---
