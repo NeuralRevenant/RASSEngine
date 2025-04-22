@@ -104,7 +104,6 @@ flowchart TD
 
 - Python 3.8+
 - Local services (with appropriate ports):
-  - Redis
   - OpenSearch
   - Ollama (any embedding model)
 - PostgreSQL + Prisma ORM
@@ -131,7 +130,6 @@ OPENAI_API_KEY=...
 BLUEHIVEAI_URL=http://localhost:8001/generate
 OPENSEARCH_HOST=localhost
 OPENSEARCH_PORT=9200
-REDIS_HOST=localhost
 EMB_DIR=notes
 POSTGRES_DSN=postgresql://...
 ...
@@ -206,7 +204,6 @@ Streams the response token-by-token — perfect for UI integration.
 | Embeddings    | Ollama (any local model) |
 | Retrieval     | OpenSearch (Text + Vector) |
 | LLM Backend   | BlueHive / OpenAI      |
-| Caching       | Redis            |
 | DB Storage    | PostgreSQL + Prisma    |
 | File Upload   | FastAPI Upload Service |
 | Ingestion     | FHIR Parser     |
@@ -226,18 +223,13 @@ Streams the response token-by-token — perfect for UI integration.
 
 ## 🔧 Dev & Debug Tips
 
-- Use `redis-cli` to inspect cache:
-  ```bash
-  redis-cli lrange query_cache_lfu 0 -1
-  ```
 - Change embedding model at runtime by editing `.env`:
   ```env
   OLLAMA_EMBED_MODEL=jina-embed-en
   ```
-- Control chunk sizes, ANN behavior, and similarity threshold via:
+- Control chunk sizes via:
   ```env
   CHUNK_SIZE=512
-  CACHE_SIM_THRESHOLD=0.96
   ```
 
 ---
