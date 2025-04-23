@@ -27,7 +27,7 @@ flowchart TD
   %% RASS Engine (Query Microservice)
   subgraph RASSEngine["RASS Engine (port 8000)"]
     A1["Receive Query"]
-    A2["NER Preprocessing"]
+    A2["Named Entity Recognition (NER) Preprocessing"]
     A3["Intent Classification"]
     A4["Fetch Chat History (Prisma)"]
     A5["embed_query()"]
@@ -86,7 +86,7 @@ flowchart TD
 
 - ✅ **Natural language interface** using REST & WebSocket endpoints.
 - 🧠 **Zero-shot intent classifier** (via HuggingFace model) determines: SEMANTIC, KEYWORD, HYBRID, STRUCTURED, etc.
-- 🧠 **Named Entity Recognition** via HF model identifies the named entities for better retrieval and generation.
+- 🧠 **Named Entity Recognition (NER)** via HF model identifies the named entities for better retrieval and generation.
 - 🧬 **Dynamic embedding model selection** via .env (Ollama API)
 - 📂 **Upload flow** supports .json, .txt, .md files
 - 🧩 **FHIR parsing, adaptive chunking, and embedding**
@@ -165,6 +165,25 @@ This service handles file uploads (`.json` FHIR bundles or `.txt` medical notes)
 
 ### `POST /ask`
 
+**Sample Request - on Structured Record Data**:
+
+```json
+{
+    "query": "Get details for patient Julian Stamm395.",
+    "user_id": "e49a9325-916d-443b-a7be-30d292910995",
+    "chat_id": "f75f6c2a-fbcd-4246-adcb-07f4e5da5e02",
+    "top_k": "5"
+}
+```
+
+**Sample Response**:
+{
+  "query": "What is Ghrelin?",
+  "answer": "Patient Name: Julian Stamm395, Patient Id: XYZ, ..."
+}
+
+
+**Sample Request - on Unstructured Plain-text notes**:
 ```json
 {
   "query": "What is Ghrelin?",
@@ -190,7 +209,7 @@ Streams the response token-by-token — perfect for UI integration.
 
 ## 📚 FHIR Ingestion Pipeline
 
-- Handles `.json` FHIR Bundles and `.txt` notes.
+- Handles `.json` FHIR Bundles, markdown (.md) and plain-text (`.txt`) notes.
 - Uses `resourceType` to extract both:
   - Structured fields (e.g., Patient, Condition, Observation).
   - Narrative sections (e.g., `text.div`, `note[]`) for semantic embedding.
