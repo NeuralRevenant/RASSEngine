@@ -8,7 +8,6 @@ openai  # OpenAI GPT-4o API calls
 python-dotenv
 werkzeug
 asyncpg
-psycopg2
 prisma
 pydantic
 torch>=1.13.1

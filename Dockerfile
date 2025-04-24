@@ -1,23 +1,20 @@
-# Use Ubuntu base image for CUDA support
-FROM nvidia/cuda:12.2.0-runtime-ubuntu22.04
+FROM python:3.10-slim-bookworm
 
-# Install Python & dependencies
-RUN apt-get update && apt-get install -y \
-    python3 python3-pip git curl && \
-    rm -rf /var/lib/apt/lists/*
-
-# Set working directory
 WORKDIR /app
 
-# Copy requirements and install Python packages
-COPY ./app/requirements.txt /app/requirements.txt
+RUN apt-get update && apt-get install -y \
+    curl build-essential libglib2.0-0 libsm6 libxext6 libxrender-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY ./app /app
+# Copy code
+COPY . .
 
-# Expose API port
-EXPOSE 8000
+# 🟡 Run prisma generate
+RUN prisma generate
 
-# Start the FastAPI application
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Start FastAPI app
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
