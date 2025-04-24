@@ -38,6 +38,7 @@ from opensearchpy.helpers import bulk
 from transformers import (
     AutoModelForSequenceClassification,
     AutoModelForTokenClassification,
+    AutoModelForSeq2SeqLM,
     AutoTokenizer,
 )
 import torch
@@ -124,7 +125,13 @@ else:
 
 logger.info(f"➡️  Running on: {device}")
 
-NER_MODEL_NAME = os.getenv("NER_MODEL_NAME", "Jean-Baptiste/roberta-large-ner-english")
+NER_MODEL_NAME = os.getenv(
+    "NER_MODEL_NAME",
+    "dslim/bert-base-NER",
+    # "dbmdz/t5-base-conll03-english",
+    # "google/flan-t5-large",
+    #    "Jean-Baptiste/roberta-large-ner-english"
+)
 INTENT_MODEL_NAME = os.getenv(
     "INTENT_MODEL_NAME",
     "facebook/bart-large-mnli",
@@ -135,14 +142,18 @@ INTENT_MODEL_NAME = os.getenv(
 try:
     # ner_model = BertForTokenClassification.from_pretrained(NER_MODEL_PATH).to(device)
     # ner_tokenizer = BertTokenizerFast.from_pretrained(NER_MODEL_PATH)
+    ner_tokenizer = AutoTokenizer.from_pretrained(NER_MODEL_NAME, use_fast=True)
     ner_model = AutoModelForTokenClassification.from_pretrained(NER_MODEL_NAME).to(
         device
     )
-    ner_tokenizer = AutoTokenizer.from_pretrained(NER_MODEL_NAME, use_fast=True)
+
+    # ner_tokenizer = AutoTokenizer.from_pretrained(NER_MODEL_NAME, use_fast=True)
+    # ner_model = AutoModelForSeq2SeqLM.from_pretrained(NER_MODEL_NAME).to(device)
 
     if hasattr(torch, "compile") and device.type == "cuda":
         ner_model = torch.compile(ner_model)
 
+    id2label = ner_model.config.id2label  # for decoding
     logger.info(f"Loaded NER model: {NER_MODEL_NAME}")
 except Exception as e:
     logger.error(f"Failed to load NER model: {e}")
@@ -2175,35 +2186,6 @@ INTENT_CATEGORIES = [
     "DOCUMENT_FETCH",
 ]
 
-# Few-shot examples embedded in the classifier prompt
-# FEW_SHOT_EXAMPLES = """
-# Classify the query into one of these intents: SEMANTIC, KEYWORD, HYBRID, STRUCTURED, HYBRID_STRUCTURED, AGGREGATE, COMPARISON, TEMPORAL, EXPLANATORY, MULTI_INTENT, ENTITY_SPECIFIC, DOCUMENT_FETCH.
-
-# Examples:
-# 1. Query: "What are the symptoms of diabetes?" Intent: EXPLANATORY
-# 2. Query: "Fetch the medical records for patient John Doe." Intent: DOCUMENT_FETCH
-# 3. Query: "How many patients have hypertension?" Intent: AGGREGATE
-# 4. Query: "Compare the outcomes of heart surgery vs. medication." Intent: COMPARISON
-# 5. Query: "Show me trends in blood pressure for patient 123 over time." Intent: TEMPORAL
-# 6. Query: "Find patients with heart disease." Intent: HYBRID
-# 7. Query: "Get details for patient Jane Smith." Intent: ENTITY_SPECIFIC
-# 8. Query: "Search for diabetes treatment options." Intent: SEMANTIC
-# 9. Query: "List all procedures with CPT code 99213." Intent: STRUCTURED
-# 10. Query: "Find patients with both asthma and allergies." Intent: HYBRID_STRUCTURED
-# 11. Query: "Explain the procedure for knee replacement and list patients who had it." Intent: MULTI_INTENT
-# 12. Query: "Look up ICD-10 code I21." Intent: KEYWORD
-# 13. Query: "Fetch records of patient with name Mary Johnson or number 456 or address 123 Main St." Intent: ENTITY_SPECIFIC
-# 14. Query: "Fetch me the details of patients with heart problems." Intent: HYBRID
-# 15. Query: "What is the status of the medication request for patient 789?" Intent: EXPLANATORY
-# 16. Query: "Get the latest lab results for patient 101." Intent: DOCUMENT_FETCH
-# 17. Query: "How many patients were treated in the last month?" Intent: AGGREGATE
-# 18. Query: "Compare the lab results of patient 202 and patient 303." Intent: COMPARISON
-# 19. Query: "Show me the trends in cholesterol levels for patient 404 over the last year." Intent: TEMPORAL
-# 20. Query: "Get me the details of the procedure performed on patient 505." Intent: ENTITY_SPECIFIC
-# 21. Query: "Get me the document for Julian140" Intent: DOCUMENT_FETCH
-# 22. Query: "Get me the document for Julian140 and the procedure code 99213" Intent: MULTI_INTENT
-# """
-
 FEW_SHOT_EXAMPLES = """
 Classify the query into one of these intents: SEMANTIC, KEYWORD, HYBRID, STRUCTURED, HYBRID_STRUCTURED, AGGREGATE, COMPARISON, TEMPORAL, EXPLANATORY, MULTI_INTENT, ENTITY_SPECIFIC, DOCUMENT_FETCH.
 
@@ -2247,11 +2229,321 @@ Examples:
 26. Query: "Search for CPT 90792." Intent: KEYWORD
 """
 
+FEW_SHOT_NER_EXAMPLES = json.dumps(
+    [
+        {
+            "sentence": "Dr. Alice Wong prescribed Metformin to John Doe on 12 May 2021.",
+            "entities": [
+                {"text": "Dr. Alice Wong", "label": "DOCTOR"},
+                {"text": "Metformin", "label": "MEDICATION"},
+                {"text": "John Doe", "label": "PERSON"},
+                {"text": "12 May 2021", "label": "DATE"},
+            ],
+        },
+        {
+            "sentence": "Patient Mary Johnson (female) lives at 123 Main St, Boston.",
+            "entities": [
+                {"text": "Mary Johnson", "label": "PERSON"},
+                {"text": "female", "label": "GENDER"},
+                {"text": "123 Main St, Boston", "label": "ADDRESS"},
+            ],
+        },
+        {
+            "sentence": "Dr. Carlos Reyes reviewed the chart yesterday.",
+            "entities": [
+                {"text": "Dr. Carlos Reyes", "label": "DOCTOR"},
+                {"text": "yesterday", "label": "DATE"},
+            ],
+        },
+        {
+            "sentence": "The patient suffers from chronic hypertension.",
+            "entities": [{"text": "chronic hypertension", "label": "CONDITION"}],
+        },
+        {
+            "sentence": "He was diagnosed with type 2 diabetes mellitus last year.",
+            "entities": [{"text": "type 2 diabetes mellitus", "label": "CONDITION"}],
+        },
+        {
+            "sentence": "Ibuprofen 400 mg was administered twice a day.",
+            "entities": [{"text": "Ibuprofen 400 mg", "label": "MEDICATION"}],
+        },
+        {
+            "sentence": "Warfarin therapy was initiated at discharge.",
+            "entities": [{"text": "Warfarin", "label": "MEDICATION"}],
+        },
+        {
+            "sentence": "A coronary-artery bypass graft was performed on 5 Jan 2019.",
+            "entities": [
+                {"text": "coronary-artery bypass graft", "label": "PROCEDURE"},
+                {"text": "5 Jan 2019", "label": "DATE"},
+            ],
+        },
+        {
+            "sentence": "Colonoscopy revealed polyps in the sigmoid colon.",
+            "entities": [
+                {"text": "Colonoscopy", "label": "PROCEDURE"},
+                {"text": "sigmoid colon", "label": "ANATOMY"},
+            ],
+        },
+        {
+            "sentence": "CBC test showed elevated white-blood-cell count.",
+            "entities": [{"text": "CBC test", "label": "LABTEST"}],
+        },
+        {
+            "sentence": "An HbA1c test was ordered for glucose monitoring.",
+            "entities": [{"text": "HbA1c test", "label": "LABTEST"}],
+        },
+        {
+            "sentence": "There is edema in the left lower leg.",
+            "entities": [{"text": "left lower leg", "label": "ANATOMY"}],
+        },
+        {
+            "sentence": "Pain reported in the lumbar spine region.",
+            "entities": [{"text": "lumbar spine", "label": "ANATOMY"}],
+        },
+        {
+            "sentence": "Blood pressure reading was 150/95 mmHg.",
+            "entities": [{"text": "150/95 mmHg", "label": "OBS_VALUE"}],
+        },
+        {
+            "sentence": "Temperature registered at 38.5 °C during the night.",
+            "entities": [{"text": "38.5 °C", "label": "OBS_VALUE"}],
+        },
+        {
+            "sentence": "ICD-10 code I21 was added to the problem list.",
+            "entities": [{"text": "I21", "label": "ICD10_CODE"}],
+        },
+        {
+            "sentence": "Problems include ICD-10 code E11.9 for diabetes.",
+            "entities": [{"text": "E11.9", "label": "ICD10_CODE"}],
+        },
+        {
+            "sentence": "He underwent repair coded as CPT 33533.",
+            "entities": [{"text": "CPT 33533", "label": "CPT_CODE"}],
+        },
+        {
+            "sentence": "Schedule a biopsy billed under CPT 11102.",
+            "entities": [{"text": "CPT 11102", "label": "CPT_CODE"}],
+        },
+        {
+            "sentence": "Lab results correspond to LOINC 4548-4.",
+            "entities": [{"text": "LOINC 4548-4", "label": "LOINC_CODE"}],
+        },
+        {
+            "sentence": "Order the lipid panel identified by LOINC 1753-3.",
+            "entities": [{"text": "LOINC 1753-3", "label": "LOINC_CODE"}],
+        },
+        {
+            "sentence": "Follow-up appointment set for 3 March 2020.",
+            "entities": [{"text": "3 March 2020", "label": "DATE"}],
+        },
+        {
+            "sentence": "The newborn is male.",
+            "entities": [{"text": "male", "label": "GENDER"}],
+        },
+        {
+            "sentence": "Contact number is 555-123-4567 for any queries.",
+            "entities": [{"text": "555-123-4567", "label": "PHONE"}],
+        },
+        {
+            "sentence": "Emergency contact: (617) 555-9876.",
+            "entities": [{"text": "(617) 555-9876", "label": "PHONE"}],
+        },
+        {
+            "sentence": "Send reports to jane.doe@example.com.",
+            "entities": [{"text": "jane.doe@example.com", "label": "EMAIL"}],
+        },
+        {
+            "sentence": "Doctor's email is reyes.c@hospital.org.",
+            "entities": [{"text": "reyes.c@hospital.org", "label": "EMAIL"}],
+        },
+        {
+            "sentence": "The clinic address is 789 Elm Rd, Springfield, IL.",
+            "entities": [{"text": "789 Elm Rd, Springfield, IL", "label": "ADDRESS"}],
+        },
+        {
+            "sentence": "Patient recently moved to 42 Baker Street, London.",
+            "entities": [{"text": "42 Baker Street, London", "label": "ADDRESS"}],
+        },
+        {
+            "sentence": "Treatment was provided at Mass General Hospital.",
+            "entities": [{"text": "Mass General Hospital", "label": "ORGANIZATION"}],
+        },
+        {
+            "sentence": "Records were transferred from Mayo Clinic.",
+            "entities": [{"text": "Mayo Clinic", "label": "ORGANIZATION"}],
+        },
+        {
+            "sentence": "The condition is classified as severe.",
+            "entities": [{"text": "severe", "label": "SEVERITY"}],
+        },
+        {
+            "sentence": "Assessment notes mark the asthma as mild persistent.",
+            "entities": [{"text": "mild persistent", "label": "SEVERITY"}],
+        },
+        {
+            "sentence": "Patient reports an allergy to penicillin.",
+            "entities": [{"text": "penicillin", "label": "ALLERGY"}],
+        },
+        {
+            "sentence": "Allergic reaction noted to latex during surgery.",
+            "entities": [{"text": "latex", "label": "ALLERGY"}],
+        },
+    ]
+)
 
-# ==============================================================================
-# NER and Intent Preprocessing
-# ==============================================================================
-def ner_preprocess(query: str) -> Optional[Dict]:
+NER_PROMPT_HEAD = (
+    """
+You are an named entity recognition (NER) assistant. Return a JSON array where each element is
+{"text": "<span>", "label": "<ENTITY>"} identified from the natural language query provided to you.
+
+Entity labels you know:
+PERSON, DOCTOR, CONDITION, MEDICATION, PROCEDURE, LABTEST, ANATOMY,
+OBS_VALUE, ICD10_CODE, CPT_CODE, LOINC_CODE, DATE, GENDER, PHONE, EMAIL,
+ADDRESS, ORGANIZATION, SEVERITY, ALLERGY.
+
+### NER examples:
+"""
+    + FEW_SHOT_NER_EXAMPLES
+)
+
+# ======================================================================
+# 2️⃣  TOKEN‑CLASSIFICATION  ➜  BLUEHIVE  FALLBACK
+# ======================================================================
+
+ENTITY_THRESHOLD = 0.80  # prob below → fallback to BlueHive
+INTENT_THRESHOLD = 0.75  # entailment prob below → fallback
+
+
+def _bio_ner(query: str) -> List[Dict[str, str]]:
+    """
+    Fast token‑classification pass.
+    Returns a *list* of {"text": …, "label": …} or empty list.
+    """
+    enc = ner_tokenizer(
+        query, return_tensors="pt", truncation=True, padding=True, max_length=128
+    ).to(device)
+
+    with torch.inference_mode():
+        out = ner_model(**enc)
+        scores = torch.nn.functional.softmax(out.logits, dim=-1)[0]  # [seq, num_lbl]
+
+    preds = torch.argmax(scores, dim=-1).cpu().numpy()
+    tokens = ner_tokenizer.convert_ids_to_tokens(enc["input_ids"][0])
+    id2lab = ner_model.config.id2label
+
+    entities, buf, cur_lab, cur_conf = [], [], None, 0.0
+    for tok, pid in zip(tokens, preds):
+        lab = id2lab[pid]
+        if tok in ner_tokenizer.all_special_tokens:  # [CLS]/[SEP]/etc
+            continue
+
+        prob = scores[len(buf)][pid].item()  # prob of this tag
+        if lab.startswith("B-"):
+            if cur_lab:  # flush previous span
+                entities.append(
+                    {
+                        "text": ner_tokenizer.convert_tokens_to_string(buf).strip(),
+                        "label": cur_lab,
+                        "conf": cur_conf / len(buf),
+                    }
+                )
+            buf, cur_lab, cur_conf = [tok], lab[2:], prob
+        elif lab.startswith("I-") and cur_lab == lab[2:]:
+            buf.append(tok)
+            cur_conf += prob
+        else:
+            if cur_lab:
+                entities.append(
+                    {
+                        "text": ner_tokenizer.convert_tokens_to_string(buf).strip(),
+                        "label": cur_lab,
+                        "conf": cur_conf / len(buf),
+                    }
+                )
+            buf, cur_lab, cur_conf = [], None, 0.0
+
+    if cur_lab:
+        entities.append(
+            {
+                "text": ner_tokenizer.convert_tokens_to_string(buf).strip(),
+                "label": cur_lab,
+                "conf": cur_conf / len(buf),
+            }
+        )
+
+    # throw away the confidences for the caller
+    return [
+        {"text": e["text"], "label": e["label"]}
+        for e in entities
+        if e["conf"] >= ENTITY_THRESHOLD
+    ]
+
+
+async def _bluehive_ner(query: str) -> List[Dict[str, str]]:
+    prompt = NER_PROMPT_HEAD + f'\n\nSentence: "{query}"\nEntities:\n'
+    raw = await bluehive_generate_text(
+        prompt=prompt,
+        system_msg=(
+            "You are a named entity recognition (NER) assistant for a medical EHR system processing FHIR-based, markdown, and plain-text data. Your task is to extract medical entities from user queries and return them in a strict JSON array format for OpenSearch filter generation. Follow these rules to ensure accurate, professional, and reliable output:\n"
+            '1) Strict JSON Output: Return ONLY a JSON array where each element is an object with \'text\' (the entity string) and \'label\' (the entity type). Example: [{"text": "Julian140", "label": "PATIENT_ID"}, {"text": "diabetes", "label": "CONDITION"}]. Do NOT include markdown (e.g., ```json), comments, prefixes like \'Entities:\', or any extra text.\n'
+            "2) Valid Entity Labels: Use only these labels: PERSON, DOCTOR, CONDITION, MEDICATION, PROCEDURE, LABTEST, ANATOMY, OBS_VALUE, ICD10_CODE, CPT_CODE, LOINC_CODE, DATE, GENDER, PHONE, EMAIL, ADDRESS, ORGANIZATION, SEVERITY, ALLERGY, PATIENT_ID. Exclude any entity that does not match these labels.\n"
+            "3) Query-Based Extraction: Extract entities solely from the provided query text. Do not infer entities from external knowledge, context, or chat history. For example, in 'Get me the document for Julian140', identify 'Julian140' as 'PATIENT_ID'.\n"
+            "4) Accurate Entity Boundaries: Capture full entity phrases accurately. For multi-word entities (e.g., 'type 2 diabetes'), include the entire phrase as one entity. Do not split entities unless they are distinct.\n"
+            "5) No Context Usage: Ignore any provided context or chat history unless explicitly part of the query. Focus only on the query string.\n"
+            "6) Handle Empty Cases: If no entities are identified, return an empty JSON array: []. Do not fabricate entities for ambiguous or general queries.\n"
+            "7) No Explanations or Reasoning: Do not include chain-of-thought, explanations, or narrative text. Output must be a JSON array and nothing else.\n"
+            "8) Examples:\n"
+            '   - Query: \'Patient Julian140 has diabetes\' → [{"text": "Julian140", "label": "PATIENT_ID"}, {"text": "diabetes", "label": "CONDITION"}]\n'
+            '   - Query: \'Dr. Alice Wong prescribed Metformin\' → [{"text": "Dr. Alice Wong", "label": "DOCTOR"}, {"text": "Metformin", "label": "MEDICATION"}]\n'
+            '   - Query: \'Get me the document for John Doe\' → [{"text": "John Doe", "label": "PERSON"}]\n'
+            "   - Query: 'General health question' → []\n"
+            "9) Error Prevention: Ensure the output is valid JSON. Avoid syntax errors, missing brackets, or invalid characters. If unsure, return [] to prevent parsing errors.\n"
+            "10) Purpose: Your output will be used to create OpenSearch filter clauses. Accuracy and adherence to the specified format are critical."
+        ),
+    )
+    raw = raw.strip()
+    logger.debug(f"BlueHive raw output: {raw!r}")
+    raw = re.sub(r"```(?:json)?\n?", "", raw).strip()
+    if not raw:
+        logger.warning("BlueHive returned empty response")
+        return []
+    if not raw.startswith("[") and "[" in raw and "]" in raw:
+        raw = raw[raw.find("[") : raw.rfind("]") + 1]
+    elif not raw.startswith("["):
+        raw = "[]"
+    try:
+        entities = json.loads(raw)
+        if not isinstance(entities, list):
+            raise ValueError("Expected a JSON array")
+        valid_entities = [
+            {"text": e["text"], "label": e["label"]}
+            for e in entities
+            if "text" in e and "label" in e and e["label"] in ENTITY_FIELD_MAP
+        ]
+        logger.debug(f"Parsed entities: {valid_entities}")
+        return valid_entities
+    except Exception as exc:
+        logger.warning(f"BlueHive NER parse error: {exc} • raw: {raw!r}")
+        return []
+
+
+async def ner_preprocess(query: str) -> List[Dict[str, str]]:
+    """
+    Try Bio‑BERT token classifier first; if it returns nothing,
+    or overall zero matches for PERSON etc., fall back to BlueHive.
+    """
+    # ents = _bio_ner(query)
+    # if ents:
+    # return ents
+
+    # logger.info("Token NER found nothing → falling back to BlueHive NER")
+    result = await _bluehive_ner(query)
+    print(f"Query: {query}, result from ozwellAI: {result}")
+    return result
+
+
+def legacy_ner_preprocess(query: str) -> Optional[Dict]:
     inputs = ner_tokenizer(
         query, return_tensors="pt", truncation=True, padding=True, max_length=128
     ).to(device)
@@ -2300,6 +2592,7 @@ def ner_preprocess(query: str) -> Optional[Dict]:
         value = entity["text"].strip().lower()
         if label not in ENTITY_FIELD_MAP:
             continue
+
         fields = ENTITY_FIELD_MAP[label]
         if label == "DATE":
             if isinstance(fields, list):
@@ -2315,26 +2608,6 @@ def ner_preprocess(query: str) -> Optional[Dict]:
             must_filters.append({"match_phrase": {field: value}})
 
     return {"bool": {"must": must_filters}} if must_filters else None
-
-
-# def classify_intent(query: str) -> str:
-#     inputs = intent_tokenizer(
-#         query, return_tensors="pt", truncation=True, padding=True, max_length=128
-#     ).to(device)
-#     with torch.inference_mode():
-#         outputs = intent_model(**inputs)
-
-#     logits = outputs.logits
-#     predicted_id = torch.argmax(logits, dim=-1).item()
-#     try:
-#         intent = intent_model.config.id2label[predicted_id].upper()
-#         if intent not in INTENT_CATEGORIES:
-#             logger.warning(f"Invalid intent '{intent}', falling back to HYBRID")
-#             return "HYBRID"
-#         return intent
-#     except KeyError:
-#         logger.error("Intent ID not found in id2label, falling back to HYBRID")
-#         return "HYBRID"
 
 
 def classify_intent(query: str) -> str:
@@ -2361,82 +2634,114 @@ def classify_intent(query: str) -> str:
     return INTENT_CATEGORIES[best_label_id]
 
 
-# def classify_intent(query: str) -> str:
-#     try:
-#         # Construct full prompt using few-shot context
-#         full_prompt = FEW_SHOT_EXAMPLES + f'\n\nQuery: "{query}" → Intent:'
-
-#         result = intent_classifier(
-#             full_prompt, candidate_labels=INTENT_CATEGORIES, multi_label=False
-#         )
-#         top_label = result["labels"][0].upper()
-
-#         if top_label not in INTENT_CATEGORIES:
-#             logger.warning(f"Invalid intent '{top_label}', falling back to HYBRID")
-#             return "HYBRID"
-
-#         return top_label
-#     except Exception as e:
-#         logger.error(f"Intent classification failed: {e}, falling back to HYBRID")
-#         return "HYBRID"
-
-
-def extract_patient_id(query: str) -> Optional[str]:
-    # First, try NER-based extraction
-    inputs = ner_tokenizer(
-        query, return_tensors="pt", truncation=True, padding=True, max_length=128
-    ).to(device)
-    with torch.inference_mode():
-        outputs = ner_model(**inputs)
-
-    logits = outputs.logits
-    predictions = torch.argmax(logits, dim=-1)[0].cpu().numpy()
-    tokens = ner_tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
-    id2label = ner_model.config.id2label
-
-    patient_tokens = []
-    for token, pred_id in zip(tokens, predictions):
-        label = id2label[pred_id]
-        if label == "B-PATIENT" or label == "I-PATIENT":
-            patient_tokens.append(token.replace("##", ""))
-
-    if patient_tokens:
-        return "".join(patient_tokens)
-
-    # Fallback to regex-based ID extraction like "Julian140"
-    match = re.search(r"(Julian\d+)", query, re.IGNORECASE)
-    return match.group(1) if match else None
-
-
-async def resolve_patient_id_from_name(
+async def resolve_patient_ids_from_name(
     query: str,
     client: OpenSearch,
     index_name: str,
-) -> Optional[str]:
-    match = re.search(r"\b(Julian\d+)\b", query, re.IGNORECASE)
-    if not match:
-        return None
+    *,
+    top_k: int = 3,
+) -> Tuple[Optional[str], List[str]]:
+    """
+    Uses BlueHive to extract PERSON or PATIENT from query and resolves patient IDs via OpenSearch.
+    Returns: (extracted name | None, [patientId, …] possibly empty)
+    """
+    # Prepare prompt for BlueHive
+    prompt = NER_PROMPT_HEAD + f'\n\nSentence: "{query.strip()}"\nEntities:\n'
 
-    patient_name_candidate = match.group(1)
+    # Define strict system message for JSON output
+    system_msg = (
+        "You are a named entity recognition (NER) assistant for a medical EHR system processing FHIR-based, markdown, and plain-text data. Your task is to extract medical entities from user queries and return them in a strict JSON array format for OpenSearch filter generation. Follow these rules to ensure accurate, professional, and reliable output:\n"
+        '1) Strict JSON Output: Return ONLY a JSON array where each element is an object with \'text\' (the entity string) and \'label\' (the entity type). Example: [{"text": "Julian140", "label": "PATIENT_ID"}, {"text": "John Doe", "label": "PERSON"}]. Do NOT include markdown (e.g., ```json), comments, prefixes like \'Entities:\', or any extra text.\n'
+        "2) Valid Entity Labels: Use only these labels: PERSON, DOCTOR, CONDITION, MEDICATION, PROCEDURE, LABTEST, ANATOMY, OBS_VALUE, ICD10_CODE, CPT_CODE, LOINC_CODE, DATE, GENDER, PHONE, EMAIL, ADDRESS, ORGANIZATION, SEVERITY, ALLERGY, PATIENT_ID. Exclude any entity that does not match these labels.\n"
+        "3) Query-Based Extraction: Extract entities solely from the provided query text. Do not infer entities from external knowledge, context, or chat history. For example, in 'Get me the document for Julian140', identify 'Julian140' as 'PATIENT_ID'.\n"
+        "4) Accurate Entity Boundaries: Capture full entity phrases accurately. For multi-word entities (e.g., 'John Doe'), include the entire phrase as one entity. Do not split entities unless they are distinct.\n"
+        "5) No Context Usage: Ignore any provided context or chat history unless explicitly part of the query. Focus only on the query string.\n"
+        "6) Handle Empty Cases: If no entities are identified, return an empty JSON array: []. Do not fabricate entities for ambiguous or general queries.\n"
+        "7) No Explanations or Reasoning: Do not include chain-of-thought, explanations, or narrative text. Output must be a JSON array and nothing else.\n"
+        "8) Examples:\n"
+        '   - Query: \'Patient Julian140 has diabetes\' → [{"text": "Julian140", "label": "PATIENT_ID"}, {"text": "diabetes", "label": "CONDITION"}]\n'
+        '   - Query: \'Dr. Alice Wong prescribed Metformin\' → [{"text": "Dr. Alice Wong", "label": "DOCTOR"}, {"text": "Metformin", "label": "MEDICATION"}]\n'
+        '   - Query: \'Get me the document for John783\' → [{"text": "John783", "label": "PERSON"}]\n'
+        "   - Query: 'General health question' → []\n"
+        "9) Error Prevention: Ensure the output is valid JSON. Avoid syntax errors, missing brackets, or invalid characters. If unsure, return [] to prevent parsing errors.\n"
+        "10) Purpose: Your output will be used to extract PERSON or PATIENT entities to resolve patient IDs via OpenSearch. Accuracy and adherence to the specified format are critical."
+    )
+
+    # Call BlueHive API
+    raw = await bluehive_generate_text(prompt=prompt, system_msg=system_msg)
+    logger.debug(f"BlueHive raw output: {raw!r}")
+
+    # Clean and parse response
+    raw = raw.strip()
+    raw = re.sub(r"```(?:json)?\n?", "", raw).strip()  # Remove markdown
+    if not raw:
+        logger.warning("BlueHive returned empty response")
+        return None, []
+    if not raw.startswith("[") and "[" in raw and "]" in raw:
+        raw = raw[raw.find("[") : raw.rfind("]") + 1]
+    elif not raw.startswith("["):
+        raw = "[]"  # Default to empty array for non-JSON responses
+
+    try:
+        entities = json.loads(raw)
+        if not isinstance(entities, list):
+            raise ValueError("Expected a JSON array")
+    except Exception as exc:
+        logger.warning(f"BlueHive NER parse error: {exc} • raw: {raw!r}")
+        return None, []
+
+    # Extract first PERSON or PATIENT name
+    extracted_name = next(
+        (
+            e["text"]
+            for e in entities
+            if e.get("label") in {"PERSON", "PATIENT", "PATIENT_ID"}
+        ),
+        None,
+    )
+
+    if not extracted_name:
+        return None, []
+
+    extracted_name = extracted_name.strip()
+
+    # OpenSearch lookup for matching patientId(s)
     query_body = {
-        "size": 1,
-        "_source": ["patientId", "patientName"],
-        "query": {"match_phrase": {"patientName": patient_name_candidate}},
+        "size": top_k,
+        "_source": ["patientId"],
+        "collapse": {"field": "patientId"},
+        "query": {
+            "bool": {
+                "should": [
+                    {"term": {"patientName.keyword": extracted_name}},
+                    {"match_phrase": {"patientName": extracted_name}},
+                    {
+                        "match": {
+                            "patientName": {
+                                "query": extracted_name,
+                                "operator": "and",
+                                "fuzziness": "AUTO",
+                            }
+                        }
+                    },
+                ],
+                "minimum_should_match": 1,
+            }
+        },
     }
 
     try:
         resp = client.search(index=index_name, body=query_body)
-        hits = resp.get("hits", {}).get("hits", [])
-        if hits:
-            resolved_id = hits[0]["_source"].get("patientId")
-            logger.info(
-                f"Resolved '{patient_name_candidate}' to patientId: {resolved_id}"
-            )
-            return resolved_id
+        ids = [
+            hit["_source"]["patientId"]
+            for hit in resp.get("hits", {}).get("hits", [])
+            if hit["_source"].get("patientId")
+        ]
+        logger.info(f"Resolved patient name '{extracted_name}' → {ids}")
+        return extracted_name, ids
     except Exception as e:
         logger.error(f"Patient ID resolution failed: {e}")
-
-    return None
+        return extracted_name, []
 
 
 # ==============================================================================
@@ -2462,15 +2767,19 @@ async def ask(
         raise HTTPException(status_code=403, detail="Chat not found or unauthorized")
 
     #  apply NER and intent classification
-    filter_clause = ner_preprocess(query)
+    filter_clause = await ner_preprocess(query)
     intent = classify_intent(query)
     # patient_id = infer_patient_id_from_filename(query) or None
 
     index_name = get_index_name(user_id)
-    patient_id = await resolve_patient_id_from_name(query, os_client, index_name)
+    patient_name, patient_ids = await resolve_patient_ids_from_name(
+        query, os_client, index_name, top_k=top_k
+    )
+    primary_patient_id = patient_ids[0] if patient_ids else None
 
     logger.info(
-        f"Intent: {intent}, Filter Clause: {filter_clause}, Patient ID: {patient_id}"
+        f"Intent: {intent}, Filter: {filter_clause}, "
+        f"PatientName: {patient_name}, PatientIds: {patient_ids}"
     )
 
     # fetch last 'MAX_CHAT_HISTORY' messages for context
@@ -2494,7 +2803,7 @@ async def ask(
 
     if intent == "DOCUMENT_FETCH":
         results = os_indexer.document_fetch_search(
-            query, k=top_k, filter_clause=filter_clause, patient_id=patient_id
+            query, k=top_k, filter_clause=filter_clause, patient_id=primary_patient_id
         )
         if not results:
             return "No matching documents found."
@@ -2537,7 +2846,14 @@ async def ask(
         if not retrieved_docs:
             return "No accessible documents found for the patient."
 
-        return json.dumps({"patient_records": retrieved_docs}, indent=2)
+        return json.dumps(
+            {
+                "queried_name": patient_name,
+                "matched_patientIds": patient_ids,
+                "patient_records": retrieved_docs,
+            },
+            indent=2,
+        )
 
     search_methods = {
         "SEMANTIC": os_indexer.semantic_search,
@@ -2555,7 +2871,7 @@ async def ask(
     search_method = search_methods.get(intent, os_indexer.hybrid_search)
     if intent == "AGGREGATE":
         result = search_method(
-            query, filter_clause=filter_clause, patient_id=patient_id
+            query, filter_clause=filter_clause, patient_id=primary_patient_id
         )
         return json.dumps(result, indent=2)
 
@@ -2565,14 +2881,14 @@ async def ask(
             query_emb=query_emb,
             k=top_k,
             filter_clause=filter_clause,
-            patient_id=patient_id,
+            patient_id=primary_patient_id,
         )
     else:
         partial_results = search_method(
             query=query,
             k=top_k,
             filter_clause=filter_clause,
-            patient_id=patient_id,
+            patient_id=primary_patient_id,
         )
 
     context_map = {}
@@ -2774,14 +3090,17 @@ async def ask_websocket_endpoint(websocket: WebSocket):
             return
 
         # apply NER and intent classification
-        filter_clause = ner_preprocess(query)
+        filter_clause = await ner_preprocess(query)
         intent = classify_intent(query)
         # patient_id = infer_patient_id_from_filename(query) or None
 
         index_name = get_index_name(user_id)
-        patient_id = await resolve_patient_id_from_name(query, os_client, index_name)
+        patient_name, patient_ids = await resolve_patient_ids_from_name(
+            query, os_client, index_name, top_k=top_k
+        )
+        primary_patient_id = patient_ids[0] if patient_ids else None
         logger.info(
-            f"[WebSocket Debug] Intent: {intent}, Filter Clause: {filter_clause}, Patient ID: {patient_id}"
+            f"Intent: {intent}, Filter: {filter_clause}, " f"PatientIds: {patient_ids}"
         )
 
         # Fetch chat history
@@ -2804,7 +3123,10 @@ async def ask_websocket_endpoint(websocket: WebSocket):
         # perform retrieval based on intent
         if intent == "DOCUMENT_FETCH":
             results = os_indexer.document_fetch_search(
-                query, k=top_k, filter_clause=filter_clause, patient_id=patient_id
+                query,
+                k=top_k,
+                filter_clause=filter_clause,
+                patient_id=primary_patient_id,
             )
             if not results:
                 await websocket.send_text(
@@ -2821,6 +3143,7 @@ async def ask_websocket_endpoint(websocket: WebSocket):
                 if patient_id and file_path:
                     if patient_id not in patient_files:
                         patient_files[patient_id] = set()
+
                     patient_files[patient_id].add((file_path, file_type))
 
             if not patient_files:
@@ -2863,7 +3186,14 @@ async def ask_websocket_endpoint(websocket: WebSocket):
                 await websocket.close()
                 return
 
-            final_answer = json.dumps({"patient_records": retrieved_docs}, indent=2)
+            final_answer = json.dumps(
+                {
+                    "queried_name": patient_name,
+                    "matched_patientIds": patient_ids,
+                    "patient_records": retrieved_docs,
+                },
+                indent=2,
+            )
             await websocket.send_text(final_answer)
 
             current_time = datetime.now(timezone.utc).isoformat()
@@ -2903,7 +3233,7 @@ async def ask_websocket_endpoint(websocket: WebSocket):
 
         if intent == "AGGREGATE":
             result = search_method(
-                query, filter_clause=filter_clause, patient_id=patient_id
+                query, filter_clause=filter_clause, patient_id=primary_patient_id
             )
             final_answer = json.dumps(result, indent=2)
             await websocket.send_text(final_answer)
@@ -2934,14 +3264,14 @@ async def ask_websocket_endpoint(websocket: WebSocket):
                 query_emb=query_emb,
                 k=top_k,
                 filter_clause=filter_clause,
-                patient_id=patient_id,
+                patient_id=primary_patient_id,
             )
         else:
             partial_results = search_method(
                 query=query,
                 k=top_k,
                 filter_clause=filter_clause,
-                patient_id=patient_id,
+                patient_id=primary_patient_id,
             )
 
         context_map = {}

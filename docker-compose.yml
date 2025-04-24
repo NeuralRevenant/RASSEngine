@@ -1,51 +1,51 @@
 version: '3.8'
 
 services:
-  app:
+  opensearch:
+    image: opensearchproject/opensearch:2.11.1
+    container_name: opensearch
+    environment:
+      - discovery.type=single-node
+      - plugins.security.disabled=true
+      - OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: curl -s http://localhost:9200 || exit 1
+      interval: 10s
+      retries: 10
+      start_period: 20s
+
+  ollama:
+    image: ollama/ollama
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    command: ["serve"]
+    healthcheck:
+      test: curl -s http://localhost:11434/api/tags || exit 1
+      interval: 10s
+      retries: 10
+      start_period: 20s
+
+  rass-engine:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: semantic-query-engine
+    container_name: rass_engine
     ports:
       - "8000:8000"
     depends_on:
-      - redis
-      - opensearch
+      opensearch:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
     environment:
-      - REDIS_HOST=redis
+      - OLLAMA_API_URL=http://ollama:11434/api
       - OPENSEARCH_HOST=opensearch
       - OPENSEARCH_PORT=9200
-      - HF_HOME=/root/.cache/huggingface
-      - HUGGINGFACE_HUB_CACHE=/root/.cache/huggingface
-      - HUGGINGFACE_TOKEN=ACCESS_TOKEN
-    volumes:
-      - /home/user-home/.cache/huggingface:/root/.cache/huggingface  # Mount the token inside the container
-      - /home/user-home/.cache/huggingface/hub:/root/.cache/huggingface/hub  # Cache models inside container
-
-    # Enable GPU usage
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1        # or "all"
-              capabilities: ["gpu"]
-
-    # If the Docker version doesn't support the above,
-    # can use runtime: nvidia with older Docker versions:
-    # runtime: nvidia
-
-  redis:
-    image: redis:latest
-    container_name: redis-cache
-    ports:
-      - "6379:6379"
-
-  opensearch:
-    image: opensearchproject/opensearch:latest
-    container_name: opensearch-db
-    environment:
-      - discovery.type=single-node
-      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=PASSWORD
-    ports:
-      - "9200:9200"
+      - OPENSEARCH_INDEX_NAME=medical-docs
+      - TOP_K=3
+      - MAX_CHAT_HISTORY=10
+      - MAX_FILES_PER_PATIENT=5
+    restart: unless-stopped

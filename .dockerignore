@@ -1,0 +1,39 @@
+# Bytecode / cache
+__pycache__/
+*.py[cod]
+*.so
+
+# Environment & Config
+.env
+.env.*
+*.db
+*.log
+
+# Version control & editor config
+.git
+.gitignore
+.vscode/
+.idea/
+
+# System files
+.DS_Store
+*.swp
+
+# Node & frontend (if any)
+node_modules/
+
+# Jupyter/IPython
+*.ipynb_checkpoints
+*.ipynb
+
+# Build & dist
+*.egg-info/
+build/
+dist/
+
+# Large model outputs / datasets / uploads
+uploads/
+datasets/
+sample_dataset/
+ner_model/
+rag_env/
